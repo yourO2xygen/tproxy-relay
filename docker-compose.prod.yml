@@ -1,0 +1,41 @@
+# Production compose: C# relay + official MTProxy behind the existing host nginx.
+# Usage:
+#   cp deploy/production/.env.example .env   # fill TPROXY_PUBLIC_HOSTNAME, TPROXY_SECRET_HEX
+#   docker compose -f docker-compose.prod.yml up -d --build
+services:
+  relay:
+    build:
+      context: .
+      dockerfile: deploy/relay/Dockerfile
+    container_name: tproxy-relay
+    environment:
+      TPROXY_PUBLIC_HOSTNAME: ${TPROXY_PUBLIC_HOSTNAME}
+      TPROXY_SECRET_HEX: ${TPROXY_SECRET_HEX}
+      TPROXY_BACKEND_HOST: mtproxy:2398
+      TPROXY_CARRIER_MODE: ${TPROXY_CARRIER_MODE:-https}
+      TPROXY_TOKEN_KEY_PATH: /data/token.key
+    volumes:
+      - relay-data:/data
+    ports:
+      - "127.0.0.1:8080:8080"   # host nginx proxies here
+      - "127.0.0.1:8081:8081"   # admin: healthz/readyz/metrics, loopback only
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8081/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+
+  mtproxy:
+    build: deploy/mtproxy
+    container_name: tproxy-mtproxy
+    environment:
+      MTPROXY_SECRET: ${TPROXY_SECRET_HEX}
+      # Behind docker NAT derive middle-end keys from the public address:
+      # MTPROXY_NAT_ARGS: "--nat-info 172.x.x.x:<PUBLIC_IP>"
+      MTPROXY_NAT_ARGS: ${MTPROXY_NAT_ARGS:-}
+    restart: unless-stopped
+    # no published ports: reachable only from the relay over the compose network
+
+volumes:
+  relay-data:

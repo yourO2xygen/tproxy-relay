@@ -1,0 +1,11 @@
+# Direct relay access (bypassing nginx) for isolation tests.
+# Usage: docker compose -f docker-compose.yml -f docker-compose.direct.yml up -d --build relay
+# Then:  dotnet run --project tools/TproxyTestClient -- --host proxy.example.com --port 8080 --plain [--ws]
+services:
+  relay:
+    environment:
+      TPROXY_CARRIER_MODE: websocket
+      TPROXY_REQUIRE_HOST: "false"
+    ports: !override
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8081:8081"
