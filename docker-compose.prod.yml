@@ -13,7 +13,7 @@ services:
     container_name: tproxy-relay
     environment:
       TPROXY_PUBLIC_HOSTNAME: ${TPROXY_PUBLIC_HOSTNAME}
-      TPROXY_SECRET_HEX: ${TPROXY_SECRET_HEX}
+      TPROXY_SECRET_HEX: ${TPROXY_SECRET_HEX:?err}
       TPROXY_BACKEND_HOST: mtproxy:2398
       TPROXY_CARRIER_MODE: ${TPROXY_CARRIER_MODE:-https}
       TPROXY_TOKEN_KEY_PATH: /data/token.key
@@ -37,7 +37,7 @@ services:
       context: deploy/mtproxy
     container_name: tproxy-mtproxy
     environment:
-      MTPROXY_SECRET: ${TPROXY_SECRET_HEX}
+      MTPROXY_SECRET: ${TPROXY_SECRET_HEX:?err}
       # За docker-NAT middle-end должен представляться публичным адресом.
       # IP фиксирован в сети ниже (172.20.0.2), меняется только публичная часть.
       MTPROXY_NAT_ARGS: --nat-info ${MTPROXY_LOCAL_IP:-172.20.0.2}:${MTPROXY_PUBLIC_IP}

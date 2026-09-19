@@ -40,6 +40,7 @@ public sealed class Session
     public CancellationTokenSource? ActivePoll;
     public readonly SemaphoreSlim DownCollect = new(1, 1);
     private readonly HashSet<uint> _tombstones = [];
+    private readonly Queue<uint> _tombstoneOrder = new();
     private long _lastActivityTicks = DateTime.UtcNow.Ticks;
     private int _dead;
     public bool Dead => Volatile.Read(ref _dead) == 1;
@@ -70,8 +71,14 @@ public sealed class Session
         lock (Sync)
         {
             _tombstones.Add(id);
-            if (_tombstones.Count > 4096)
-                _tombstones.Clear();
+            _tombstoneOrder.Enqueue(id);
+            if (_tombstoneOrder.Count > 4096)
+            {
+                // Evict the oldest entries instead of dropping the whole set:
+                // a full reset would let a reused stream id slip past detection.
+                while (_tombstoneOrder.Count > 4096)
+                    _tombstones.Remove(_tombstoneOrder.Dequeue());
+            }
         }
     }
 }
@@ -101,6 +108,7 @@ public sealed class RelayHub
     private readonly ILogger _log;
     private readonly ConcurrentDictionary<string, Session> _sessions = new();
     private readonly ConcurrentDictionary<string, BootstrapEntry> _bootstraps = new();
+    private int _streamsGlobal;
 
     public RelayHub(RelayOptions opt, TokenMinter minter, ILogger log)
     {
@@ -111,8 +119,10 @@ public sealed class RelayHub
 
     // ---- bootstrap / session lifecycle -------------------------------------
 
-    public string MintBootstrap()
+    public string? MintBootstrap()
     {
+        if (_bootstraps.Count >= _opt.MaxBootstrapsGlobal)
+            return null; // cap outstanding bootstraps: unauthenticated minting must not grow memory
         var token = _minter.Mint(TokenMinter.KindBootstrap);
         _bootstraps[token] = new BootstrapEntry(DateTime.UtcNow.AddSeconds(_opt.BootstrapTtlSeconds));
         Counters.BootstrapMinted();
@@ -178,7 +188,7 @@ public sealed class RelayHub
         session.Cts.Cancel();
         session.DownQueue.Writer.TryComplete();
         foreach (var st in session.Streams.Values)
-            CloseStreamInternal(session, st, enqueueClose: false);
+            CloseStreamInternal(session, st);
         _log.LogInformation("event=session_closed reason={Reason}", reason);
     }
 
@@ -229,6 +239,14 @@ public sealed class RelayHub
             foreach (var f in frames)
                 if (!FrameCodec.IsValidClientFrame(f))
                     return new UpResult(UpOutcome.Fatal, seq, $"invalid frame type={f.Type:X2} stream={f.StreamId}");
+            // Pre-validate the session budget for the WHOLE batch: a 503 must leave
+            // the batch fully unapplied (byte-identical retry), never half-written.
+            var dataBytes = 0L;
+            foreach (var f in frames)
+                if (f.Type == FrameType.Data)
+                    dataBytes += f.Payload.Length;
+            if (Interlocked.Read(ref session.PendingBytes) + dataBytes > _opt.MaxPendingBytesPerSession)
+                return new UpResult(UpOutcome.RetryLater, session.LastSeq, "data queue budget");
             Counters.FramesIn(frames.Count);
             await ApplyFrames(session, frames);
             lock (session.Sync)
@@ -266,7 +284,7 @@ public sealed class RelayHub
             switch (f.Type)
             {
                 case FrameType.Open:
-                    OpenStream(session, f.StreamId);
+                    await OpenStream(session, f.StreamId);
                     break;
                 case FrameType.Data:
                     await WriteToBackend(session, f.StreamId, f.Payload);
@@ -285,15 +303,17 @@ public sealed class RelayHub
         }
     }
 
-    private void OpenStream(Session session, uint id)
+    private async Task OpenStream(Session session, uint id)
     {
         if (id == 0)
             throw new FrameException("OPEN on stream zero");
         if (session.Streams.ContainsKey(id) || session.IsTombstoned(id))
             throw new FrameException($"stream id {id} reused");
-        if (session.Streams.Count >= _opt.MaxStreamsPerSession)
+        if (session.Streams.Count >= _opt.MaxStreamsPerSession ||
+            Interlocked.Increment(ref _streamsGlobal) > _opt.MaxStreamsGlobal)
         {
-            EnqueueDown(session, FrameCodec.Encode(FrameType.Close, id));
+            Interlocked.Decrement(ref _streamsGlobal);
+            await EnqueueDownAsync(session, FrameCodec.Encode(FrameType.Close, id));
             return;
         }
         var st = new StreamState(id)
@@ -302,7 +322,10 @@ public sealed class RelayHub
             RecvAvail = FrameCodec.InitialStreamWindow
         };
         if (!session.Streams.TryAdd(id, st))
+        {
+            Interlocked.Decrement(ref _streamsGlobal);
             throw new FrameException($"stream id {id} reused");
+        }
         Counters.StreamActiveUp();
         st.Pump = Task.Run(() => DialAndPump(session, st));
         _log.LogDebug("event=stream_open id={Id}", id);
@@ -333,14 +356,28 @@ public sealed class RelayHub
                 return;
             if (st.Net == null)
             {
-                await st.Connected.Task.WaitAsync(session.Cts.Token);
+                // A failed dial cancels the Connected task: this stream dies,
+                // the session must survive (backend blips should not force
+                // every client into a full re-bootstrap).
+                try { await st.Connected.Task.WaitAsync(session.Cts.Token); }
+                catch (OperationCanceledException) { return; }
                 if (st.Net == null || st.Closed)
                     return;
             }
-            await st.Net.WriteAsync(payload, session.Cts.Token);
+            try
+            {
+                await st.Net.WriteAsync(payload, session.Cts.Token);
+            }
+            catch (Exception e) when (e is IOException or SocketException or ObjectDisposedException)
+            {
+                // Backend socket broke: close only this stream, tell the client.
+                CloseStreamInternal(session, st);
+                await EnqueueDownAsync(session, FrameCodec.Encode(FrameType.Close, id));
+                return;
+            }
             Interlocked.Add(ref st.RecvAvail, payload.Length);
             // Grant credit back once bytes drained to the backend socket.
-            EnqueueDown(session, FrameCodec.EncodeWindow(id, (uint)payload.Length));
+            await EnqueueDownAsync(session, FrameCodec.EncodeWindow(id, (uint)payload.Length));
         }
         finally
         {
@@ -354,7 +391,7 @@ public sealed class RelayHub
             return;
         if (session.Streams.TryGetValue(id, out var st))
         {
-            CloseStreamInternal(session, st, enqueueClose: false);
+            CloseStreamInternal(session, st);
             _log.LogDebug("event=stream_close id={Id} by=client", id);
         }
     }
@@ -378,6 +415,7 @@ public sealed class RelayHub
             var tcp = new TcpClient();
             st.Client = tcp;
             await tcp.ConnectAsync(_opt.BackendHostName, _opt.BackendPort, dialCts.Token);
+            tcp.NoDelay = true; // small MTProto packets must not wait in Nagle
             st.Net = tcp.GetStream();
             st.Connected.TrySetResult();
             _log.LogDebug("event=backend_connected id={Id}", st.Id);
@@ -395,7 +433,7 @@ public sealed class RelayHub
                 if (n == 0)
                     break; // backend EOF
                 Interlocked.Add(ref st.SendAvail, -n);
-                EnqueueDown(session, FrameCodec.Encode(FrameType.Data, st.Id, buf.AsSpan(0, n)));
+                await EnqueueDownAsync(session, FrameCodec.Encode(FrameType.Data, st.Id, buf.AsSpan(0, n)));
             }
         }
         catch (Exception e) when (e is OperationCanceledException or SocketException or ObjectDisposedException or ChannelClosedException)
@@ -406,38 +444,48 @@ public sealed class RelayHub
         {
             if (!st.Connected.Task.IsCompleted)
                 st.Connected.TrySetCanceled();
-            CloseStreamInternal(session, st, enqueueClose: true);
+            if (CloseStreamInternal(session, st) &&
+                !session.Dead && !session.Cts.IsCancellationRequested)
+                _ = EnqueueDownAsync(session, FrameCodec.Encode(FrameType.Close, st.Id));
             _log.LogDebug("event=stream_close id={Id} by=backend", st.Id);
         }
     }
 
-    private void CloseStreamInternal(Session session, StreamState st, bool enqueueClose)
+    private bool CloseStreamInternal(Session session, StreamState st)
     {
         if (!st.MarkClosed())
-            return;
+            return false;
         try { st.Client?.Close(); } catch { /* ignore */ }
         session.AddTombstone(st.Id);
         session.Streams.TryRemove(st.Id, out _);
+        Interlocked.Decrement(ref _streamsGlobal);
         Counters.StreamActiveDown();
-        if (enqueueClose && !session.Dead && !session.Cts.IsCancellationRequested)
-            EnqueueDown(session, FrameCodec.Encode(FrameType.Close, st.Id));
+        return true;
     }
 
     // ---- downlink -----------------------------------------------------------
 
-    private void EnqueueDown(Session session, byte[] frame)
+    private async ValueTask EnqueueDownAsync(Session session, byte[] frame)
     {
+        if (session.Dead)
+            return;
         Interlocked.Add(ref session.PendingBytes, frame.Length);
         Counters.FramesOut(1);
-        if (!session.DownQueue.Writer.TryWrite(frame))
+        // Downlink byte gate: a client that grants WINDOW but never drains its
+        // down queue must not grow relay memory without bound.
+        if (Interlocked.Read(ref session.PendingBytes) >
+            _opt.MaxPendingBytesPerSession + _opt.DownBatchTargetBytes)
         {
-            // Bounded queue is momentarily full; retry without blocking the caller.
-            _ = Task.Run(async () =>
-            {
-                try { await session.DownQueue.Writer.WriteAsync(frame); }
-                catch (ChannelClosedException) { /* session is gone */ }
-            });
+            CloseSession(session, "downlink budget");
+            return;
         }
+        // Bounded channel in Wait mode: when the queue is full the producer
+        // (stream pump) suspends here — natural backpressure that also keeps
+        // per-stream frame order. No fire-and-forget fallback: that reordered
+        // frames and grew an unbounded task backlog.
+        try { await session.DownQueue.Writer.WriteAsync(frame, session.Cts.Token); }
+        catch (ChannelClosedException) { /* session is gone */ }
+        catch (OperationCanceledException) { /* session is closing */ }
     }
 
     public async Task<DownResult> GetDown(Session session, long cursor, CancellationToken ct)
@@ -590,6 +638,7 @@ public sealed class RelayHub
                 _log.LogDebug("event=ws_send bytes={Bytes} frames={Frames}", body.Length, frames.Count);
                 Counters.DownBatch(body.Length);
                 await ws.SendAsync(body, WebSocketMessageType.Binary, true, ct);
+                session.Touch(); // ws carrier: activity keeps the idle reaper away
                 _log.LogDebug("event=ws_sent bytes={Bytes}", body.Length);
             }
         }, ct);
@@ -620,7 +669,19 @@ public sealed class RelayHub
                         goto done;
                 _log.LogDebug("event=ws_recv bytes={Bytes} frames={Frames}", ms.Length, frames.Count);
                 Counters.FramesIn(frames.Count);
-                await ApplyFrames(session, frames);
+                session.Touch(); // ws carrier: activity keeps the idle reaper away
+                try
+                {
+                    await ApplyFrames(session, frames);
+                }
+                catch (BudgetException)
+                {
+                    // Budget is exhausted: frames of this batch are partially
+                    // applied and there is no seq/retry on the ws carrier, so the
+                    // only safe outcome is a clean session restart.
+                    CloseSession(session, "ws data queue budget");
+                    goto done;
+                }
                 Counters.UpBatch((int)ms.Length);
             }
         done:;

@@ -32,9 +32,6 @@ var nonce=null;
 var m=location.hash.match(/^#android=([A-Za-z0-9_-]+)/);
 if(m)nonce=m[1];
 history.replaceState(null,'','/');
-window.__dbg=function(msg){try{fetch('/dbg?m='+encodeURIComponent(String(msg).slice(0,120)),{mode:'same-origin'});}catch(e){}};
-window.addEventListener('error',function(ev){window.__dbg('jserr:'+(ev.message||'')+' @'+(ev.lineno||0));});
-window.addEventListener('unhandledrejection',function(ev){window.__dbg('rej:'+(ev.reason&&ev.reason.message||ev.reason));});
 
 function sleep(ms){return new Promise(function(r){setTimeout(r,ms);});}
 

@@ -14,6 +14,7 @@ public sealed class RelayOptions
     public int MaxSessionsGlobal { get; init; } = 128;
     public int MaxStreamsGlobal { get; init; } = 4096;
     public int MaxStreamsPerSession { get; init; } = 128;
+    public int MaxBootstrapsGlobal { get; init; } = 512;
     public long MaxPendingBytesPerSession { get; init; } = 32 * 1024 * 1024;
     public int DownBatchTargetBytes { get; init; } = 2 * 1024 * 1024;
     public int LongPollSeconds { get; init; } = 25;
@@ -36,8 +37,12 @@ public sealed class RelayOptions
 
     public static RelayOptions Load()
     {
-        var secretHex = Env("TPROXY_SECRET_HEX", "000102030405060708090a0b0c0d0e0f");
-        var secret = Convert.FromHexString(secretHex);
+        var secretHex = Environment.GetEnvironmentVariable("TPROXY_SECRET_HEX");
+        if (string.IsNullOrWhiteSpace(secretHex))
+            throw new InvalidOperationException("TPROXY_SECRET_HEX is required (openssl rand -hex 16): refusing to start with no secret");
+        byte[] secret;
+        try { secret = Convert.FromHexString(secretHex); }
+        catch (Exception e) { throw new InvalidOperationException("TPROXY_SECRET_HEX must be valid hex", e); }
         if (secret.Length is not (16 or 17))
             throw new InvalidOperationException("TPROXY_SECRET_HEX must decode to 16 (or 17 with dd-prefix) bytes");
         var backend = Env("TPROXY_BACKEND_HOST", "backend-stub:9000");
@@ -53,6 +58,7 @@ public sealed class RelayOptions
             MaxSessionsGlobal = int.Parse(Env("TPROXY_MAX_SESSIONS", "128")),
             MaxStreamsGlobal = int.Parse(Env("TPROXY_MAX_STREAMS", "4096")),
             MaxStreamsPerSession = int.Parse(Env("TPROXY_MAX_STREAMS_PER_SESSION", "128")),
+            MaxBootstrapsGlobal = int.Parse(Env("TPROXY_MAX_BOOTSTRAPS", "512")),
             RequireHost = Env("TPROXY_REQUIRE_HOST", "true") is not ("false" or "0"),
         };
         if (opt.CarrierMode is not ("https" or "websocket"))
