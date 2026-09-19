@@ -58,7 +58,10 @@ services:
     read_only: true
     tmpfs:
       - /tmp
+    # mtproto-proxy drops to 'nobody' itself: it needs SETGID/SETUID to
+    # surrender privileges; everything else is dropped.
     cap_drop: [ALL]
+    cap_add: [SETGID, SETUID]
     security_opt: [no-new-privileges:true]
     pids_limit: 512
     mem_limit: 512m
