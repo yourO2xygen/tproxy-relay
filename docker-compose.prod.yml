@@ -1,9 +1,12 @@
-# Production compose: C# relay + official MTProxy behind the existing host nginx.
-# Usage:
-#   cp deploy/production/.env.example .env   # fill TPROXY_PUBLIC_HOSTNAME, TPROXY_SECRET_HEX
-#   docker compose -f docker-compose.prod.yml up -d --build
+# Прод-конфигурация: C#-релей + MTProxy в контейнерах за хостовым nginx.
+# nginx ставится отдельно (см. deploy/production/nginx-vhost.conf.example).
+#
+# Использование:
+#   cp deploy/production/.env.example .env   # или: deploy/production/setup.sh <домен>
+#   docker compose -f docker-compose.prod.yml up -d
 services:
   relay:
+    image: tproxy-relay:latest
     build:
       context: .
       dockerfile: deploy/relay/Dockerfile
@@ -16,9 +19,11 @@ services:
       TPROXY_TOKEN_KEY_PATH: /data/token.key
     volumes:
       - relay-data:/data
+    networks:
+      - tproxy-net
     ports:
-      - "127.0.0.1:8080:8080"   # host nginx proxies here
-      - "127.0.0.1:8081:8081"   # admin: healthz/readyz/metrics, loopback only
+      - "127.0.0.1:8080:8080"   # сюда проксирует хостовый nginx
+      - "127.0.0.1:8081:8081"   # admin: healthz/readyz/metrics, только loopback
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8081/healthz"]
@@ -27,15 +32,27 @@ services:
       retries: 12
 
   mtproxy:
-    build: deploy/mtproxy
+    image: tproxy-mtproxy:latest
+    build:
+      context: deploy/mtproxy
     container_name: tproxy-mtproxy
     environment:
       MTPROXY_SECRET: ${TPROXY_SECRET_HEX}
-      # Behind docker NAT derive middle-end keys from the public address:
-      # MTPROXY_NAT_ARGS: "--nat-info 172.x.x.x:<PUBLIC_IP>"
-      MTPROXY_NAT_ARGS: ${MTPROXY_NAT_ARGS:-}
+      # За docker-NAT middle-end должен представляться публичным адресом.
+      # IP фиксирован в сети ниже (172.20.0.2), меняется только публичная часть.
+      MTPROXY_NAT_ARGS: --nat-info ${MTPROXY_LOCAL_IP:-172.20.0.2}:${MTPROXY_PUBLIC_IP}
+    networks:
+      tproxy-net:
+        ipv4_address: 172.20.0.2
     restart: unless-stopped
-    # no published ports: reachable only from the relay over the compose network
+    # порты наружу не публикуются: доступен только релею внутри сети
+
+networks:
+  tproxy-net:
+    name: tproxy-net
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
 
 volumes:
   relay-data:
