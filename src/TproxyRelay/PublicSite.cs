@@ -30,19 +30,22 @@ public static class PublicSite
 </html>
 """;
 
-    public static async Task Index(HttpContext ctx)
+    private static readonly byte[] IndexBytes = System.Text.Encoding.UTF8.GetBytes(IndexHtml);
+    private static readonly byte[] NotFoundBytes = System.Text.Encoding.UTF8.GetBytes(NotFoundHtml);
+
+    public static Task Index(HttpContext ctx)
     {
         ctx.Response.StatusCode = 200;
         ctx.Response.ContentType = "text/html; charset=utf-8";
         ctx.Response.Headers.CacheControl = "no-cache";
-        await ctx.Response.Body.WriteAsync(System.Text.Encoding.UTF8.GetBytes(IndexHtml));
+        return ctx.Response.Body.WriteAsync(IndexBytes).AsTask();
     }
 
-    public static async Task NotFound(HttpContext ctx)
+    public static Task NotFound(HttpContext ctx)
     {
         ctx.Response.StatusCode = 404;
         ctx.Response.ContentType = "text/html; charset=utf-8";
         ctx.Response.Headers.CacheControl = "no-cache";
-        await ctx.Response.Body.WriteAsync(System.Text.Encoding.UTF8.GetBytes(NotFoundHtml));
+        return ctx.Response.Body.WriteAsync(NotFoundBytes).AsTask();
     }
 }

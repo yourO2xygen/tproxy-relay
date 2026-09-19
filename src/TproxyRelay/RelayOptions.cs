@@ -25,7 +25,7 @@ public sealed class RelayOptions
     public string BackendHostName { get; }
     public int BackendPort { get; }
 
-    private RelayOptions(string backendHost)
+    public RelayOptions(string backendHost)
     {
         var parts = backendHost.Split(':', 2);
         BackendHostName = parts[0];
@@ -37,9 +37,14 @@ public sealed class RelayOptions
 
     public static RelayOptions Load()
     {
+        // Secret can come from a file (TPROXY_SECRET_HEX_FILE, docker-secrets
+        // style) instead of environment to keep it out of `docker inspect`.
         var secretHex = Environment.GetEnvironmentVariable("TPROXY_SECRET_HEX");
+        if (string.IsNullOrWhiteSpace(secretHex) &&
+            Environment.GetEnvironmentVariable("TPROXY_SECRET_HEX_FILE") is { Length: > 0 } path)
+            secretHex = File.ReadAllText(path).Trim();
         if (string.IsNullOrWhiteSpace(secretHex))
-            throw new InvalidOperationException("TPROXY_SECRET_HEX is required (openssl rand -hex 16): refusing to start with no secret");
+            throw new InvalidOperationException("TPROXY_SECRET_HEX (or TPROXY_SECRET_HEX_FILE) is required (openssl rand -hex 16): refusing to start with no secret");
         byte[] secret;
         try { secret = Convert.FromHexString(secretHex); }
         catch (Exception e) { throw new InvalidOperationException("TPROXY_SECRET_HEX must be valid hex", e); }

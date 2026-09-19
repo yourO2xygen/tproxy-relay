@@ -11,9 +11,13 @@ services:
       context: .
       dockerfile: deploy/relay/Dockerfile
     container_name: tproxy-relay
+    user: "10001:10001"
     environment:
       TPROXY_PUBLIC_HOSTNAME: ${TPROXY_PUBLIC_HOSTNAME}
-      TPROXY_SECRET_HEX: ${TPROXY_SECRET_HEX:?err}
+      # Секрет: либо TPROXY_SECRET_HEX, либо файл TPROXY_SECRET_HEX_FILE
+      # (docker secrets); релей откажется стартовать без секрета.
+      TPROXY_SECRET_HEX: ${TPROXY_SECRET_HEX:-}
+      TPROXY_SECRET_HEX_FILE: ${TPROXY_SECRET_HEX_FILE:-}
       TPROXY_BACKEND_HOST: mtproxy:2398
       TPROXY_CARRIER_MODE: ${TPROXY_CARRIER_MODE:-https}
       TPROXY_TOKEN_KEY_PATH: /data/token.key
@@ -24,6 +28,13 @@ services:
     ports:
       - "127.0.0.1:8080:8080"   # сюда проксирует хостовый nginx
       - "127.0.0.1:8081:8081"   # admin: healthz/readyz/metrics, только loopback
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    mem_limit: 512m
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8081/healthz"]
@@ -40,11 +51,23 @@ services:
       MTPROXY_SECRET: ${TPROXY_SECRET_HEX:?err}
       # За docker-NAT middle-end должен представляться публичным адресом.
       # IP фиксирован в сети ниже (172.20.0.2), меняется только публичная часть.
-      MTPROXY_NAT_ARGS: --nat-info ${MTPROXY_LOCAL_IP:-172.20.0.2}:${MTPROXY_PUBLIC_IP}
+      MTPROXY_NAT_ARGS: --nat-info ${MTPROXY_LOCAL_IP:-172.20.0.2}:${MTPROXY_PUBLIC_IP:?err}
     networks:
       tproxy-net:
         ipv4_address: 172.20.0.2
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 512
+    mem_limit: 512m
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/2398 && echo ok || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 5
     # порты наружу не публикуются: доступен только релею внутри сети
 
 networks:

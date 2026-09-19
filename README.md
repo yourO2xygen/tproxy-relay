@@ -51,8 +51,10 @@ deploy/production/setup.sh proxy.yourdomain.tld
 ```
 
 `setup.sh` сам определит публичный IP, сгенерирует секрет и создаст `.env`
-(600). Альтернатива вручную: `cp deploy/production/.env.example .env` и заполнить
-`TPROXY_SECRET_HEX` (`openssl rand -hex 16`) и `MTPROXY_PUBLIC_IP`.
+(600, секрет не печатается в терминал; показать кредиты — `setup.sh <домен> --show`).
+Альтернатива вручную: `cp deploy/production/.env.example .env` и заполнить
+`TPROXY_SECRET_HEX` (`openssl rand -hex 16`) и `MTPROXY_PUBLIC_IP`. Секрет можно
+передавать файлом (`TPROXY_SECRET_HEX_FILE`, docker-secrets-стиль) вместо env.
 
 ### 3. Контейнеры
 
@@ -137,7 +139,10 @@ MTProxy за docker-NAT обязан представляться middle-end'у 
 - `GET /api/v1/ws`: WebSocket-несущая (`tproxy-v1.<token>`).
 - Кадры OPEN/DATA/CLOSE/WINDOW/PONG + flow control 4 МиБ на стрим, tombstones,
   лимиты сессий/стримов/pending-байтов, 503+Retry-After при переполнении.
-- Admin: `/healthz`, `/readyz`, `/metrics` (отдельный порт, наружу не проброшен).
+- Admin: `/healthz`, `/readyz`, `/metrics` (отдельный порт, наружу не проброшен);
+  метрики включают `tproxy_pending_bytes`, `tproxy_backend_dials_in_flight`,
+  `tproxy_limit_hits_total`.
+- Юнит-тесты: `dotnet test tests/TproxyRelay.Tests`; CI: build + test + docker build.
 
 ## Упрощения относительно референса
 

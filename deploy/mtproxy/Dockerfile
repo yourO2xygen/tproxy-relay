@@ -17,6 +17,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/MTProxy/objs/bin/mtproto-proxy /usr/local/bin/mtproto-proxy
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN chmod +x /entrypoint.sh \
+    # Bake cluster configs at build time: runtime must not fetch trust anchors
+    # from the network on every start.
+    && mkdir -p /etc/mtproxy \
+    && curl -fsSL --retry 5 https://core.telegram.org/getProxySecret -o /etc/mtproxy/proxy-secret \
+    && curl -fsSL --retry 5 https://core.telegram.org/getProxyConfig -o /etc/mtproxy/proxy-multi.conf \
+    && chmod 644 /etc/mtproxy/*
+# mtproto-proxy drops to an unprivileged user itself (-u nobody).
 EXPOSE 2398 8888
 ENTRYPOINT ["/entrypoint.sh"]

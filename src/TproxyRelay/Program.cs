@@ -23,12 +23,17 @@ builder.WebHost.ConfigureKestrel(k =>
     k.Limits.MaxConcurrentConnections = 256;
     k.Limits.MaxConcurrentUpgradedConnections = 64;
 });
+builder.Services.Configure<HostOptions>(o => o.ShutdownTimeout = TimeSpan.FromSeconds(30));
 
 var app = builder.Build();
 
 var minter = new TokenMinter(TokenMinter.LoadOrCreateKey(opt.TokenKeyPath));
 var hub = new RelayHub(opt, minter, app.Logger);
 _ = hub.StartReaper(app.Lifetime.ApplicationStopping);
+// Graceful shutdown: close all sessions so carriers observe a clean end
+// (Close frames / cancelled polls) instead of TCP resets; long polls (25s)
+// fit into the explicit 30s drain window.
+app.Lifetime.ApplicationStopping.Register(() => hub.CloseAllSessions("shutdown"));
 
 app.Logger.LogInformation(
     "event=started hostname={Host} backend={Backend} carrier={Mode} listen={Port} admin={AdminPort}",
