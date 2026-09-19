@@ -11,19 +11,29 @@ builder.Logging.AddSimpleConsole(o =>
     o.SingleLine = true;
     o.TimestampFormat = "HH:mm:ss ";
 });
+// Request logs at Information would leak bridge URLs (capability!) into
+// container logs; keep framework noise at Warning.
+builder.Logging.AddFilter("Microsoft.AspNetCore", LogLevel.Warning);
 builder.WebHost.ConfigureKestrel(k =>
 {
     k.ListenAnyIP(opt.ListenPort);
     k.ListenAnyIP(opt.AdminPort);
     k.Limits.MaxRequestBodySize = 4 * 1024 * 1024;
     k.Limits.MaxRequestLineSize = 16 * 1024;
+    k.Limits.MaxConcurrentConnections = 256;
+    k.Limits.MaxConcurrentUpgradedConnections = 64;
 });
+builder.Services.Configure<HostOptions>(o => o.ShutdownTimeout = TimeSpan.FromSeconds(30));
 
 var app = builder.Build();
 
 var minter = new TokenMinter(TokenMinter.LoadOrCreateKey(opt.TokenKeyPath));
 var hub = new RelayHub(opt, minter, app.Logger);
 _ = hub.StartReaper(app.Lifetime.ApplicationStopping);
+// Graceful shutdown: close all sessions so carriers observe a clean end
+// (Close frames / cancelled polls) instead of TCP resets; long polls (25s)
+// fit into the explicit 30s drain window.
+app.Lifetime.ApplicationStopping.Register(() => hub.CloseAllSessions("shutdown"));
 
 app.Logger.LogInformation(
     "event=started hostname={Host} backend={Backend} carrier={Mode} listen={Port} admin={AdminPort}",
@@ -92,6 +102,12 @@ app.MapGet("/", async (HttpContext ctx) =>
     if (exact && value.Length == 43 && CapabilityDeriver.Matches(value, opt.CapabilityBytes))
     {
         var bootstrap = hub.MintBootstrap();
+        if (bootstrap == null)
+        {
+            ctx.Response.StatusCode = 503; // outstanding bootstrap cap
+            ctx.Response.Headers["Retry-After"] = "2";
+            return;
+        }
         await BridgePage.Write(ctx, bootstrap, opt.CarrierMode, opt.PublicHostname);
         return;
     }
@@ -119,11 +135,16 @@ app.MapPost("/api/v1/session", async (HttpContext ctx) =>
         return;
     }
     using var ms = new MemoryStream();
-    await ctx.Request.Body.CopyToAsync(ms);
+    await ctx.Request.Body.CopyToAsync(ms, ctx.RequestAborted);
+    if (ms.Length > 64)
+    {
+        ctx.Response.StatusCode = 400; // also catches oversized chunked bodies
+        return;
+    }
     var body = ms.ToArray();
     if (!FrameCodec.IsValidHello(body))
     {
-        app.Logger.LogWarning("event=session_400 reason=invalid_hello len={Len} hex={Hex}", body.Length, Convert.ToHexString(body));
+        app.Logger.LogWarning("event=session_400 reason=invalid_hello len={Len}", body.Length);
         ctx.Response.StatusCode = 400;
         return;
     }
@@ -143,7 +164,7 @@ app.MapPost("/api/v1/session", async (HttpContext ctx) =>
             ctx.Response.Headers["Retry-After"] = "1";
             return;
         default:
-            app.Logger.LogWarning("event=session_400 reason=redeem_invalid bootstraps={Count}", hub.BootstrapCount);
+            app.Logger.LogWarning("event=session_400 reason=redeem_invalid");
             ctx.Response.StatusCode = 400;
             return;
     }
@@ -235,6 +256,11 @@ app.MapPost("/api/v1/down", async (HttpContext ctx) =>
 
 app.MapDelete("/api/v1/session", async (HttpContext ctx) =>
 {
+    if (!HostOk(ctx))
+    {
+        await PublicSite.NotFound(ctx);
+        return;
+    }
     var session = hub.AuthSession(Bearer(ctx));
     if (session == null)
     {

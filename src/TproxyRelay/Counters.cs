@@ -4,6 +4,7 @@ public static class Counters
 {
     private static long _sessionsCreated, _sessionsActive, _streamsActive, _bootstrapsMinted;
     private static long _upBatches, _downBatches, _upBytes, _downBytes, _framesIn, _framesOut;
+    private static long _limitHits, _pendingBytes, _dialsInFlight;
 
     public static void SessionCreated() => Interlocked.Increment(ref _sessionsCreated);
     public static void SessionActiveUp() => Interlocked.Increment(ref _sessionsActive);
@@ -15,6 +16,9 @@ public static class Counters
     public static void DownBatch(long bytes) { Interlocked.Increment(ref _downBatches); Interlocked.Add(ref _downBytes, bytes); }
     public static void FramesIn(int n) => Interlocked.Add(ref _framesIn, n);
     public static void FramesOut(int n) => Interlocked.Add(ref _framesOut, n);
+    public static void LimitHit() => Interlocked.Increment(ref _limitHits);
+    public static void PendingBytes(long delta) => Interlocked.Add(ref _pendingBytes, delta);
+    public static void DialInFlight(int delta) => Interlocked.Add(ref _dialsInFlight, delta);
 
     public static string Render() =>
         $"""
@@ -38,5 +42,11 @@ public static class Counters
          tproxy_frames_in_total {Volatile.Read(ref _framesIn)}
          # TYPE tproxy_frames_out_total counter
          tproxy_frames_out_total {Volatile.Read(ref _framesOut)}
+         # TYPE tproxy_limit_hits_total counter
+         tproxy_limit_hits_total {Volatile.Read(ref _limitHits)}
+         # TYPE tproxy_pending_bytes gauge
+         tproxy_pending_bytes {Volatile.Read(ref _pendingBytes)}
+         # TYPE tproxy_backend_dials_in_flight gauge
+         tproxy_backend_dials_in_flight {Volatile.Read(ref _dialsInFlight)}
          """;
 }
