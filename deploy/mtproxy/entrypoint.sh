@@ -13,14 +13,18 @@ fi
 KEYS_FILE="${KEYS_FILE:-/keys/registry.txt}"
 POLL="${SUPERVISOR_POLL_SECONDS:-5}"
 
+# The routing config lives on the writable tmpfs so the daily refresh can
+# replace it on a read-only-rootfs deployment (the baked copy stays intact).
+cp "$CFG/proxy-multi.conf" "$RUN/proxy-multi.conf"
+
 start_one() { # port secret
     mtproto-proxy -u nobody \
         -H "$1" \
         -S "$2" \
         $MTPROXY_NAT_ARGS \
         --aes-pwd "$CFG/proxy-secret" \
-        "$CFG/proxy-multi.conf" \
-        -M 1 -C 1024 >>"/tmp/mtproxy/log-$1" 2>&1 &
+        "$RUN/proxy-multi.conf" \
+        -M 1 -C 1024 >>"$RUN/log-$1" 2>&1 &
     echo $! > "$RUN/port-$1.pid"
 }
 
@@ -56,6 +60,26 @@ start_one 2398 "$MTPROXY_SECRET"
             done
         fi
         sleep "$POLL"
+    done
+) &
+
+# Daily routing-config refresh: fetch, and only when the routing data really
+# changed, bounce every child (the supervisor respawns them; if the built-in
+# proxy dies the container restarts, which is the documented MTProxy refresh).
+(
+    while :; do
+        sleep 86400
+        if curl -fsSL https://core.telegram.org/getProxyConfig -o "$RUN/proxy-multi.conf.new" 2>/dev/null; then
+            if ! cmp -s "$RUN/proxy-multi.conf" "$RUN/proxy-multi.conf.new"; then
+                cp "$RUN/proxy-multi.conf.new" "$RUN/proxy-multi.conf"
+                for f in "$RUN"/port-*.pid; do
+                    [ -e "$f" ] || continue
+                    kill "$(cat "$f")" 2>/dev/null || true
+                    rm -f "$f"
+                done
+            fi
+            rm -f "$RUN/proxy-multi.conf.new"
+        fi
     done
 ) &
 

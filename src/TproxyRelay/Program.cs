@@ -47,6 +47,7 @@ registry.ReplaceManaged(store.ListKeys(includeRevoked: false).Where(k => k.Activ
 var hub = new RelayHub(opt, minter, app.Logger, store);
 var publicContent = PublicContent.Create(opt, app.Logger);
 AdminApi.Map(app, opt, hub, store, registry);
+TelegramBot.ValidateAndRegister(app, opt, hub, store, registry);
 _ = hub.StartReaper(app.Lifetime.ApplicationStopping);
 // Graceful shutdown: close all sessions so carriers observe a clean end
 // (Close frames / cancelled polls) instead of TCP resets; long polls (25s)

@@ -87,6 +87,36 @@ deploy/production/setup.sh proxy.yourdomain.tld --show --base-path myslug
 # Секрет:  <маркированный base64url>
 ```
 
+### Управление ключами (опционально)
+
+Ключи живут в SQLite (`/data/keys.db` на volume релея). Каждый ключ — свой
+клиентский секрет и **свой процесс MTProxy** в общем контейнере (супервизор
+читает `registry.txt` из volume). Встроенный env-секрет продолжает работать
+на порту 2398 независимо от управляемых ключей. Ревок/пауза мгновенно
+закрывает сессии ключа; трафик агрегируется по ключам и дням.
+
+Три способа управления — все опциональны, по умолчанию всё выключено
+(fail-closed: включено без обязательных параметров = отказ запуска):
+
+| Способ | Включение | Доступ |
+|---|---|---|
+| **Static** (без управления) | ничего | seed-файл `/data/keys/seed.json` (`[{"name":"ivan","secret_hex":"..."}]`), импорт при старте |
+| **Admin API** | `TPROXY_API_ENABLED=true` + `TPROXY_API_TOKEN` | loopback `:8081/admin/*`, Bearer-токен (ssh-туннель): `/admin/stats`, `/admin/keys` (CRUD, `?reveal=1` — показать секреты), `/admin/sessions`, `/admin/traffic?days=N` |
+| **Telegram-бот** | `TPROXY_BOT_ENABLED=true` + `TPROXY_BOT_TOKEN` + `TPROXY_BOT_ADMINS` | команды `/stats /keys /key <имя> /revoke /pause /resume /traffic` — только из админ-чатов |
+
+Бот выдаёт ключ вместе с готовой `t.me`-ссылкой (учитывает base path и
+маркированный секрет).
+
+### Ops
+
+- Статистика MTProxy (встроенный порт): `docker exec tproxy-mtproxy curl -s 127.0.0.1:8888/stats`
+- Метрики релея: `curl 127.0.0.1:8081/metrics` (внутри сервера)
+- Роутинг-конфиг MTProxy (`proxy-multi.conf`) обновляется супервизором
+  ежедневно; прокси перезапускается только если данные изменились
+- Обновление релея: `git pull && docker compose -f docker-compose.prod.yml up -d --build relay`
+  (сессии инвалидируются, клиенты переподключаются автоматически); откат —
+  `git checkout v1.0.0` и та же команда
+
 ### 3. Контейнеры
 
 ```bash
