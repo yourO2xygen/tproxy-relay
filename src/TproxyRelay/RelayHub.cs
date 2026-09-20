@@ -32,6 +32,7 @@ public sealed class Session
     public string KeyId { get; init; } = "builtin";
     public string BackendHostName { get; init; } = "";
     public int BackendPort { get; init; }
+    public DateTime CreatedUtc { get; init; } = DateTime.UtcNow;
     public IPAddress? ClientIp;                       // accounting address of the first valid create
     public long UpBytesTotal;                         // per-session, aggregated into the key store
     public long DownBytesTotal;
@@ -319,6 +320,15 @@ public sealed partial class RelayHub
             }
         }
     }
+
+    public sealed record SessionSnapshot(
+        string Token, string KeyId, DateTime CreatedUtc, DateTime LastActivity,
+        IPAddress? ClientIp, int Streams);
+
+    /// <summary>Sanitized live-session list for the admin surface (no tokens in output).</summary>
+    public IReadOnlyList<SessionSnapshot> SessionsSnapshot() =>
+        _sessions.Values.Select(s => new SessionSnapshot(
+            "", s.KeyId, s.CreatedUtc, s.LastActivity, s.ClientIp, s.Streams.Count)).ToArray();
 
     /// <summary>Closes every live session of one key (revocation path).</summary>
     public int CloseAllSessionsForKey(string keyId, string reason)

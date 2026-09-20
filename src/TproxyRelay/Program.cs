@@ -46,6 +46,7 @@ registry.ReplaceManaged(store.ListKeys(includeRevoked: false).Where(k => k.Activ
         opt.BackendHostName, k.BackendPort, opt.CarrierMode)));
 var hub = new RelayHub(opt, minter, app.Logger, store);
 var publicContent = PublicContent.Create(opt, app.Logger);
+AdminApi.Map(app, opt, hub, store, registry);
 _ = hub.StartReaper(app.Lifetime.ApplicationStopping);
 // Graceful shutdown: close all sessions so carriers observe a clean end
 // (Close frames / cancelled polls) instead of TCP resets; long polls (25s)
@@ -65,9 +66,10 @@ app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromSecond
 var webRoot = BasePaths.WebPath(opt.BasePath);
 
 // Admin listener lives on its own loopback port and never sees public traffic.
+// /admin/* (when enabled) falls through to the AdminApi endpoints below.
 app.Use(async (ctx, next) =>
 {
-    if (ctx.Connection.LocalPort == opt.AdminPort)
+    if (ctx.Connection.LocalPort == opt.AdminPort && !ctx.Request.Path.StartsWithSegments("/admin"))
     {
         switch (ctx.Request.Path.Value)
         {

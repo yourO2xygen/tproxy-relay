@@ -4,6 +4,18 @@ using System.Text.Json;
 
 namespace TproxyRelay;
 
+/// <summary>Management subsystem toggles: everything is opt-in and fail-closed.</summary>
+public sealed record ManagementApiConfig(bool Enabled, string AdminToken)
+{
+    public static ManagementApiConfig Disabled => new(false, "");
+}
+
+public sealed record ManagementBotConfig(bool Enabled, string Token, string AdminChatIds)
+{
+    public static ManagementBotConfig Disabled => new(false, "", "");
+    public string[] AdminChats => AdminChatIds.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+}
+
 /// <summary>
 /// Relay configuration. Precedence: built-in defaults &lt; config.json (TPROXY_CONFIG)
 /// &lt; environment variables. The client secret stays environment/file-only and is
@@ -51,6 +63,8 @@ public sealed class RelayOptions
     public int BootstrapTtlSeconds { get; init; } = 120;
     public int ReconnectGraceSeconds { get; init; } = 120;
     public bool RequireHost { get; init; } = true;
+    public ManagementApiConfig ManagementApi { get; init; } = ManagementApiConfig.Disabled;
+    public ManagementBotConfig ManagementBot { get; init; } = ManagementBotConfig.Disabled;
 
     public string BackendHostName { get; }
     public int BackendPort { get; }
@@ -94,10 +108,21 @@ public sealed class RelayOptions
             using var doc = JsonDocument.Parse(File.ReadAllText(configPath));
             foreach (var p in doc.RootElement.EnumerateObject())
             {
-                if (p.Name == "limits" || p.Name == "timeouts")
+                if (p.Name is "limits" or "timeouts")
                 {
                     foreach (var q in p.Value.EnumerateObject())
                         overrides[$"{p.Name}.{q.Name}"] = q.Value.ToString();
+                }
+                else if (p.Name == "management" && p.Value.ValueKind == JsonValueKind.Object)
+                {
+                    foreach (var sub in p.Value.EnumerateObject())
+                    {
+                        if (sub.Value.ValueKind == JsonValueKind.Object)
+                            foreach (var q in sub.Value.EnumerateObject())
+                                overrides[$"management.{sub.Name}.{q.Name}"] = q.Value.ToString();
+                        else
+                            overrides[$"management.{sub.Name}"] = sub.Value.ToString();
+                    }
                 }
                 else if (p.Value.ValueKind != JsonValueKind.Object)
                 {
@@ -167,6 +192,13 @@ public sealed class RelayOptions
             BootstrapTtlSeconds = Int(Ov("timeouts.bootstrap_ttl_seconds", env("TPROXY_BOOTSTRAP_TTL_SECONDS"), "120")),
             ReconnectGraceSeconds = Int(Ov("timeouts.reconnect_grace_seconds", env("TPROXY_RECONNECT_GRACE") ?? env("TPROXY_SESSION_IDLE_TTL"), "120")),
             RequireHost = Ov("require_host", env("TPROXY_REQUIRE_HOST"), "true") is not ("false" or "0"),
+            ManagementApi = new ManagementApiConfig(
+                Ov("management.api.enabled", env("TPROXY_API_ENABLED"), "false") is "true" or "1",
+                Ov("management.api.admin_token", env("TPROXY_API_TOKEN"), "")),
+            ManagementBot = new ManagementBotConfig(
+                Ov("management.bot.enabled", env("TPROXY_BOT_ENABLED"), "false") is "true" or "1",
+                Ov("management.bot.token", env("TPROXY_BOT_TOKEN"), ""),
+                Ov("management.bot.admin_chat_ids", env("TPROXY_BOT_ADMINS"), "")),
         };
         opt.Validate();
         return opt;

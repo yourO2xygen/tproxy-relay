@@ -26,6 +26,11 @@ services:
       TPROXY_BASE_PATH: ${TPROXY_BASE_PATH:-}
       TPROXY_TOKEN_KEY_PATH: /data/token.key
       TPROXY_KEYS_DB: /data/keys.db
+      TPROXY_API_ENABLED: ${TPROXY_API_ENABLED:-false}
+      TPROXY_API_TOKEN: ${TPROXY_API_TOKEN:-}
+      TPROXY_BOT_ENABLED: ${TPROXY_BOT_ENABLED:-false}
+      TPROXY_BOT_TOKEN: ${TPROXY_BOT_TOKEN:-}
+      TPROXY_BOT_ADMINS: ${TPROXY_BOT_ADMINS:-}
     volumes:
       - relay-data:/data
     ports:
