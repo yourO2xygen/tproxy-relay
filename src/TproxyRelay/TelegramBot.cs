@@ -44,9 +44,24 @@ public sealed class TelegramBot : BackgroundService
             return;
         var bot = new TelegramBot(cfg, opt, hub, store, registry, app.Logger);
         app.Services.GetRequiredService<IHostApplicationLifetime>()
-            .ApplicationStopping.Register(() => bot.Dispose());
-        _ = Task.Run(() => bot.StartAsync(CancellationToken.None));
+            .ApplicationStopping.Register(() =>
+            {
+                bot.Dispose();
+                try { bot.PollTask?.Wait(TimeSpan.FromSeconds(5)); } catch { /* ignore */ }
+            });
+        // Observed task: an unhandled poll failure surfaces in the host log
+        // instead of silently disappearing.
+        bot.PollTask = Task.Run(async () =>
+        {
+            try { await bot.ExecuteAsync(CancellationToken.None); }
+            catch (Exception e)
+            {
+                app.Logger.LogError("event=tg_bot_crashed err={Error}", e.Message);
+            }
+        });
     }
+
+    internal Task? PollTask;
 
     protected override async Task ExecuteAsync(CancellationToken ct) => await Poll(ct);
 
@@ -70,7 +85,12 @@ public sealed class TelegramBot : BackgroundService
             }
             return doc.RootElement.GetProperty("result");
         }
-        catch (OperationCanceledException) { throw; }
+        catch (OperationCanceledException)
+        {
+            // Timeouts here are routine (long poll): never let them kill the loop.
+            _log.LogWarning("event=tg_api_timeout method={Method}", method);
+            return null;
+        }
         catch (Exception e)
         {
             _log.LogWarning("event=tg_api_error method={Method} err={Error}", method, e.Message);
@@ -83,8 +103,18 @@ public sealed class TelegramBot : BackgroundService
         _log.LogInformation("event=tg_bot_started admins={Count}", _cfg.AdminChats.Length);
         while (!ct.IsCancellationRequested)
         {
-            var updates = await Api("getUpdates",
-                new { offset = _offset + 1, timeout = 50, allowed_updates = new[] { "message" } }, ct);
+            JsonElement? updates;
+            try
+            {
+                updates = await Api("getUpdates",
+                    new { offset = _offset + 1, timeout = 25, allowed_updates = new[] { "message" } }, ct);
+            }
+            catch (Exception e)
+            {
+                // The poll loop must survive anything, including timeouts.
+                _log.LogWarning("event=tg_poll_error err={Error}", e.Message);
+                updates = null;
+            }
             if (updates == null)
             {
                 try { await Task.Delay(5000, ct); }
@@ -106,11 +136,23 @@ public sealed class TelegramBot : BackgroundService
                 }
                 if (!msg.TryGetProperty("text", out var textEl))
                     continue;
-                var reply = await HandleCommandAsync(textEl.GetString() ?? "");
+                var text = textEl.GetString() ?? "";
+                _log.LogInformation("event=tg_command chat={ChatId} text={Text}", chat, text);
+                string reply;
+                try
+                {
+                    reply = await HandleCommandAsync(text);
+                }
+                catch (Exception e)
+                {
+                    _log.LogError("event=tg_command_failed text={Text} err={Error}", text, e.Message);
+                    reply = $"ошибка: {e.Message}";
+                }
                 if (reply.Length > 0)
                     await Send(chat, reply, ct);
             }
         }
+        _log.LogInformation("event=tg_bot_stopped");
     }
 
     internal async Task Send(long chat, string text, CancellationToken ct = default)
