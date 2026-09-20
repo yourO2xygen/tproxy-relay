@@ -243,7 +243,7 @@ public class RelayHubTests : IAsyncLifetime
     [Fact]
     public void Tombstones_EvictOldest_ButKeepRecent()
     {
-        var session = new Session { Token = "test" };
+        var session = new Session { Token = "test", CarrierMode = "https" };
         for (uint i = 1; i <= 5000; i++)
             session.AddTombstone(i);
         Assert.False(session.IsTombstoned(1));   // evicted

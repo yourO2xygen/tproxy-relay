@@ -164,7 +164,7 @@ public sealed class RelayOptions
 
     private void Validate()
     {
-        if (CarrierMode is not ("https" or "websocket"))
+        if (CarrierMode is not ("https" or "websocket" or "https-lanes" or "websocket-lanes"))
             throw new InvalidOperationException($"unsupported carrier mode {CarrierMode}");
         // 2 MiB is the desktop client's loopback-fallback message cap.
         if (DownBatchTargetBytes is < 4096 or > 2 * 1024 * 1024)

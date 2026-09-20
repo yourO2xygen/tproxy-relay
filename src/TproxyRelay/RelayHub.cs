@@ -28,8 +28,10 @@ public sealed class StreamState(uint id)
 public sealed class Session
 {
     public required string Token { get; init; }
+    public required string CarrierMode { get; init; }
     public IPAddress? ClientIp;                       // accounting address of the first valid create
     public readonly ConcurrentDictionary<uint, StreamState> Streams = new();
+    public readonly ConcurrentDictionary<uint, LaneState> Lanes = new();
     public readonly Channel<FrameBuf> DownQueue;
     public readonly object Sync = new();               // seq/cursor/pending/tombstones
     public readonly CancellationTokenSource Cts = new();
@@ -50,6 +52,8 @@ public sealed class Session
     private long _lastActivityTicks = DateTime.UtcNow.Ticks;
     private int _dead;
     public bool Dead => Volatile.Read(ref _dead) == 1;
+
+    public bool LanesMode => CarrierMode is "https-lanes" or "websocket-lanes";
 
     public Session()
     {
@@ -74,6 +78,7 @@ public sealed class Session
 
     public void AddTombstone(uint id)
     {
+        List<LaneState>? evicted = null;
         lock (Sync)
         {
             _tombstones.Add(id);
@@ -83,9 +88,17 @@ public sealed class Session
                 // Evict the oldest entries instead of dropping the whole set:
                 // a full reset would let a reused stream id slip past detection.
                 while (_tombstoneOrder.Count > 4096)
-                    _tombstones.Remove(_tombstoneOrder.Dequeue());
+                {
+                    var old = _tombstoneOrder.Dequeue();
+                    _tombstones.Remove(old);
+                    if (Lanes.TryRemove(old, out var lane))
+                        (evicted ??= []).Add(lane);
+                }
             }
         }
+        evicted?.ForEach(l => l.ReleaseAll(this));
+        if (Lanes.TryGetValue(id, out var marked))
+            marked.StreamClosed = true;
     }
 }
 
@@ -93,10 +106,11 @@ public enum UpOutcome { Acked, DuplicateAcked, RetryLater, Fatal }
 
 public sealed record UpResult(UpOutcome Outcome, int AckSeq, string? Error = null);
 
-public sealed record DownResult(byte[]? Body, long Cursor, bool HasBatch, bool ProtocolError)
+public sealed record DownResult(byte[]? Body, long Cursor, bool HasBatch, bool ProtocolError, bool LaneClosed = false)
 {
     public static DownResult Batch(byte[] body, long cursor) => new(body, cursor, true, false);
     public static DownResult Empty(long cursor) => new(null, cursor, false, false);
+    public static DownResult LaneComplete(long cursor) => new(null, cursor, false, false, true);
 }
 
 public sealed record BootstrapEntry(DateTime Expiry)
@@ -108,7 +122,7 @@ public sealed record BootstrapEntry(DateTime Expiry)
 
 public enum RedeemResult { Ok, RetryLater, Invalid }
 
-public sealed class RelayHub
+public sealed partial class RelayHub
 {
     /// <summary>Conservative per-item charge on top of encoded frame bytes.</summary>
     public const int ItemOverhead = 256;
@@ -197,7 +211,9 @@ public sealed class RelayHub
                 Counters.LimitHit();
                 return RedeemResult.RetryLater; // bootstrap stays unconsumed, retry is byte-identical
             }
-            var created = new Session { Token = _minter.Mint(TokenMinter.KindSession), ClientIp = ip };
+            var created = new Session { Token = _minter.Mint(TokenMinter.KindSession), ClientIp = ip, CarrierMode = _opt.CarrierMode };
+            if (created.LanesMode)
+                created.Lanes[0] = new LaneState(0); // session-level lane (PONG traffic)
             _sessions[created.Token] = created;
             Counters.SessionCreated();
             Counters.SessionActiveUp();
@@ -552,6 +568,76 @@ public sealed class RelayHub
             frame.Return();
             return;
         }
+        if (session.LanesMode)
+        {
+            await EnqueueDownLaneAsync(session, frame);
+            return;
+        }
+        await EnqueueDownMuxAsync(session, frame);
+    }
+
+    private async ValueTask EnqueueDownLaneAsync(Session session, FrameBuf frame)
+    {
+        // Lanes carrier: every relay frame belongs to the lane of its stream id.
+        var sid = (uint)((frame.Span[1] << 16) | (frame.Span[2] << 8) | frame.Span[3]);
+        if (!session.Lanes.TryGetValue(sid, out var lane))
+        {
+            // Tombstone-evicted or never-opened lane: late frames are ignored.
+            frame.Return();
+            return;
+        }
+        var charge = frame.Length + ItemOverhead;
+        Interlocked.Add(ref session.PendingBytes, charge);
+        Interlocked.Increment(ref session.PendingItems);
+        Interlocked.Add(ref lane.QueuedCharge, charge);
+        Interlocked.Increment(ref lane.QueuedItems);
+        Counters.PendingBytes(charge);
+        Counters.PendingItems(1);
+        Counters.FramesOut(1);
+        if (lane.QueuedCharge > LaneMaxCharge ||
+            Interlocked.Read(ref session.PendingBytes) >
+                _opt.MaxPendingBytesPerSession + _opt.DownBatchTargetBytes ||
+            Counters.PendingBytesGauge > _opt.MaxPendingBytesGlobal ||
+            Counters.PendingItemsGauge > _opt.MaxPendingItemsGlobal)
+        {
+            Counters.LimitHit();
+            if (lane.QueuedCharge > LaneMaxCharge)
+            {
+                ReleaseLaneCharge(session, lane, frame.Length, 1);
+                frame.Return();
+                if (session.Streams.TryGetValue(sid, out var st))
+                {
+                    CloseStreamInternal(session, st);
+                    _ = EnqueueDownAsync(session, FrameBuf.Buy(FrameCodec.Encode(FrameType.Close, sid)));
+                }
+                return;
+            }
+            Counters.PendingBytes(-charge);
+            Counters.PendingItems(-1);
+            Interlocked.Add(ref session.PendingBytes, -charge);
+            Interlocked.Decrement(ref session.PendingItems);
+            frame.Return();
+            CloseSession(session, "downlink budget");
+            return;
+        }
+        try { await lane.Queue.Writer.WriteAsync(frame, session.Cts.Token); }
+        catch (ChannelClosedException) { ReleaseLaneCharge(session, lane, frame.Length, 1); frame.Return(); }
+        catch (OperationCanceledException) { ReleaseLaneCharge(session, lane, frame.Length, 1); frame.Return(); }
+    }
+
+    private static void ReleaseLaneCharge(Session session, LaneState lane, int encodedBytes, int items)
+    {
+        var release = encodedBytes + items * ItemOverhead;
+        Interlocked.Add(ref session.PendingBytes, -release);
+        Interlocked.Add(ref session.PendingItems, -items);
+        Interlocked.Add(ref lane.QueuedCharge, -release);
+        Interlocked.Add(ref lane.QueuedItems, -items);
+        Counters.PendingBytes(-release);
+        Counters.PendingItems(-items);
+    }
+
+    private async ValueTask EnqueueDownMuxAsync(Session session, FrameBuf frame)
+    {
         var charge = frame.Length + ItemOverhead;
         Interlocked.Add(ref session.PendingBytes, charge);
         Interlocked.Increment(ref session.PendingItems);
@@ -585,7 +671,7 @@ public sealed class RelayHub
     }
 
     /// <summary>Releases the byte+item charge of drained frames.</summary>
-    private static void ReleaseCharge(Session session, int encodedBytes, int items)
+    internal static void ReleaseCharge(Session session, int encodedBytes, int items)
     {
         var release = encodedBytes + items * ItemOverhead;
         Interlocked.Add(ref session.PendingBytes, -release);

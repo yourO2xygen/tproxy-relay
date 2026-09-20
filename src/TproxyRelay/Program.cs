@@ -229,6 +229,31 @@ app.MapPost("/api/v1/up", async (HttpContext ctx) =>
     using var ms = new MemoryStream();
     await ctx.Request.Body.CopyToAsync(ms);
     var body = ms.ToArray();
+    var laneId = ParseLaneId(ctx, session.LanesMode);
+    if (laneId < 0)
+    {
+        ctx.Response.StatusCode = 400; // lanes mode requires a valid X-Lane-ID
+        return;
+    }
+    if (session.LanesMode)
+    {
+        var laneResult = await hub.ApplyUpLane(session, (uint)laneId, seq, body);
+        switch (laneResult.Outcome)
+        {
+            case LaneOutcome.Ok or LaneOutcome.LaneClosed:
+                ctx.Response.StatusCode = 204;
+                ctx.Response.Headers["X-Up-Ack"] = laneResult.AckSeq.ToString();
+                return;
+            case LaneOutcome.RetryLater:
+                ctx.Response.StatusCode = 503;
+                ctx.Response.Headers["Retry-After"] = "1";
+                return;
+            default:
+                hub.CloseSession(session, $"uplink error: {laneResult.Error}");
+                ctx.Response.StatusCode = 409;
+                return;
+        }
+    }
     var result = await hub.ApplyUp(session, seq, body);
     switch (result.Outcome)
     {
@@ -266,7 +291,15 @@ app.MapPost("/api/v1/down", async (HttpContext ctx) =>
         ctx.Response.StatusCode = 400;
         return;
     }
-    var result = await hub.GetDown(session, cursor, ctx.RequestAborted);
+    var laneId = ParseLaneId(ctx, session.LanesMode);
+    if (laneId < 0)
+    {
+        ctx.Response.StatusCode = 400;
+        return;
+    }
+    var result = session.LanesMode
+        ? await hub.GetDownLane(session, (uint)laneId, cursor, ctx.RequestAborted)
+        : await hub.GetDown(session, cursor, ctx.RequestAborted);
     if (result.ProtocolError)
     {
         hub.CloseSession(session, "downlink protocol error");
@@ -277,6 +310,8 @@ app.MapPost("/api/v1/down", async (HttpContext ctx) =>
     {
         ctx.Response.StatusCode = 204;
         ctx.Response.Headers["X-Down-Cursor"] = cursor.ToString();
+        if (result.LaneClosed)
+            ctx.Response.Headers["X-Lane-Closed"] = "1";
         return;
     }
     ctx.Response.StatusCode = 200;
@@ -311,26 +346,62 @@ app.MapGet("/api/v1/ws", async (HttpContext ctx) =>
         return;
     }
     const string prefix = "tproxy-v1.";
+    const string lanePrefix = "tproxy-lane-v1.";
     var proto = ctx.Request.Headers.SecWebSocketProtocol.ToString();
+    if (proto.StartsWith(lanePrefix, StringComparison.Ordinal))
+    {
+        // websocket-lanes: one socket per stream, tproxy-lane-v1.<token>.<sid>
+        var rest = proto[lanePrefix.Length..];
+        var dot = rest.IndexOf('.');
+        if (dot != 43 || !uint.TryParse(rest[(dot + 1)..], out var sid) || sid == 0)
+        {
+            await PublicSite.NotFound(ctx);
+            return;
+        }
+        var session = hub.AuthSession(rest[..dot]);
+        if (session == null || session.CarrierMode != "websocket-lanes" ||
+            session.IsTombstoned(sid) || session.Lanes.TryGetValue(sid, out var l) && l.AttachedSocket != null)
+        {
+            await PublicSite.NotFound(ctx);
+            return;
+        }
+        var laneWs = await ctx.WebSockets.AcceptWebSocketAsync(proto);
+        await hub.RunWebSocketLane(session, sid, laneWs, ctx.RequestAborted);
+        return;
+    }
     if (!proto.StartsWith(prefix, StringComparison.Ordinal))
     {
         await PublicSite.NotFound(ctx);
         return;
     }
     var token = proto[prefix.Length..];
-    var session = hub.AuthSession(token);
-    if (session == null)
+    var session2 = hub.AuthSession(token);
+    if (session2 == null)
     {
         await PublicSite.NotFound(ctx);
         return;
     }
     var ws = await ctx.WebSockets.AcceptWebSocketAsync(proto);
-    await hub.RunWebSocket(session, ws, ctx.RequestAborted);
+    await hub.RunWebSocket(session2, ws, ctx.RequestAborted);
 });
 
 app.MapFallback(async (HttpContext ctx) => await PublicSite.NotFound(ctx));
 
 app.Run();
+
+/// <summary>
+/// X-Lane-ID parsing: returns the lane id, or -1 when the header value is
+/// invalid. In lanes mode the header is mandatory; elsewhere it must be absent.
+/// </summary>
+static int ParseLaneId(HttpContext ctx, bool lanesMode)
+{
+    var present = ctx.Request.Headers.TryGetValue("X-Lane-ID", out var v);
+    if (!lanesMode)
+        return present ? -1 : 0;
+    if (!present || !uint.TryParse(v, out var lane) || lane > FrameCodec.MaxStreamId)
+        return -1;
+    return (int)lane;
+}
 
 static async Task<bool> BackendReachable(RelayOptions opt)
 {
