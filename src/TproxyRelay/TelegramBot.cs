@@ -98,7 +98,12 @@ public sealed class TelegramBot : BackgroundService
                     continue;
                 var chat = msg.GetProperty("chat").GetProperty("id").GetInt64();
                 if (!_cfg.AdminChats.Contains(chat.ToString()))
-                    continue; // strangers are invisible to the bot
+                {
+                    // Visible in the logs so an operator can bootstrap their own
+                    // chat id into management.bot.admin_chat_ids.
+                    _log.LogInformation("event=tg_stranger chat={ChatId}", chat);
+                    continue;
+                }
                 if (!msg.TryGetProperty("text", out var textEl))
                     continue;
                 var reply = await HandleCommandAsync(textEl.GetString() ?? "");
