@@ -1,0 +1,258 @@
+using System.Security.Cryptography;
+using Microsoft.Data.Sqlite;
+
+namespace TproxyRelay;
+
+/// <summary>A managed client key: one WEB secret bound to one MTProxy backend listener.</summary>
+public sealed record KeyRecord(
+    string Id,
+    string Name,
+    string SecretHex,
+    DateTime CreatedUtc,
+    DateTime? RevokedUtc,
+    bool Paused,
+    int BackendPort)
+{
+    public bool Active => RevokedUtc == null && !Paused;
+}
+
+/// <summary>
+/// SQLite-backed key registry plus daily per-key traffic aggregates.
+/// The database lives on the relay volume; the same volume carries
+/// registry.txt for the MTProxy container supervisor.
+/// </summary>
+public sealed class KeyStore
+{
+    private readonly string _connectionString;
+    private readonly string _dbPath;
+
+    /// <summary>The default MTProxy client port — the built-in env profile.</summary>
+    public const int BasePort = 2398;
+
+    public KeyStore(string dbPath)
+    {
+        _dbPath = dbPath;
+        var dir = Path.GetDirectoryName(Path.GetFullPath(dbPath));
+        if (!string.IsNullOrEmpty(dir))
+            Directory.CreateDirectory(dir);
+        _connectionString = new SqliteConnectionStringBuilder { DataSource = dbPath, Mode = SqliteOpenMode.ReadWriteCreate }.ToString();
+        Init();
+    }
+
+    public string DataDirectory => Path.GetDirectoryName(Path.GetFullPath(_dbPath))!;
+
+    private void Init()
+    {
+        using var db = Open();
+        new SqliteCommand("""
+            CREATE TABLE IF NOT EXISTS keys (
+              id TEXT PRIMARY KEY,
+              name TEXT UNIQUE NOT NULL,
+              secret_hex TEXT NOT NULL,
+              created_utc TEXT NOT NULL,
+              revoked_utc TEXT,
+              paused INTEGER NOT NULL DEFAULT 0,
+              backend_port INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS traffic_daily (
+              day TEXT NOT NULL,
+              key_id TEXT NOT NULL,
+              up_bytes INTEGER NOT NULL,
+              down_bytes INTEGER NOT NULL,
+              PRIMARY KEY (day, key_id)
+            );
+            """, db).ExecuteNonQuery();
+    }
+
+    private SqliteConnection Open()
+    {
+        var conn = new SqliteConnection(_connectionString);
+        conn.Open();
+        return conn;
+    }
+
+    // ---- keys ---------------------------------------------------------------
+
+    public IReadOnlyList<KeyRecord> ListKeys(bool includeRevoked = true)
+    {
+        using var db = Open();
+        using var cmd = db.CreateCommand();
+        cmd.CommandText = includeRevoked
+            ? "SELECT id,name,secret_hex,created_utc,revoked_utc,paused,backend_port FROM keys ORDER BY created_utc"
+            : "SELECT id,name,secret_hex,created_utc,revoked_utc,paused,backend_port FROM keys WHERE revoked_utc IS NULL ORDER BY created_utc";
+        using var r = cmd.ExecuteReader();
+        var list = new List<KeyRecord>();
+        while (r.Read())
+            list.Add(Read(r));
+        return list;
+    }
+
+    public KeyRecord? Get(string id)
+    {
+        using var db = Open();
+        using var cmd = db.CreateCommand();
+        cmd.CommandText = "SELECT id,name,secret_hex,created_utc,revoked_utc,paused,backend_port FROM keys WHERE id=$id";
+        cmd.Parameters.AddWithValue("$id", id);
+        using var r = cmd.ExecuteReader();
+        return r.Read() ? Read(r) : null;
+    }
+
+    public KeyRecord? GetByName(string name)
+    {
+        using var db = Open();
+        using var cmd = db.CreateCommand();
+        cmd.CommandText = "SELECT id,name,secret_hex,created_utc,revoked_utc,paused,backend_port FROM keys WHERE name=$name";
+        cmd.Parameters.AddWithValue("$name", name);
+        using var r = cmd.ExecuteReader();
+        return r.Read() ? Read(r) : null;
+    }
+
+    public KeyRecord Create(string name, string? secretHex = null)
+    {
+        if (string.IsNullOrWhiteSpace(name) || name.Length > 64)
+            throw new ArgumentException("key name must be 1..64 characters", nameof(name));
+        if (GetByName(name) != null)
+            throw new InvalidOperationException($"key name '{name}' already exists");
+        var secret = secretHex ?? Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
+        if (!SecretLooksValid(secret))
+            throw new ArgumentException("secret must be 32 hex characters (16 bytes)", nameof(secretHex));
+        var port = AllocatePort();
+        var id = Guid.NewGuid().ToString("N");
+        using var db = Open();
+        using var cmd = db.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO keys (id,name,secret_hex,created_utc,revoked_utc,paused,backend_port)
+            VALUES ($id,$name,$secret,$created,NULL,0,$port)
+            """;
+        cmd.Parameters.AddWithValue("$id", id);
+        cmd.Parameters.AddWithValue("$name", name);
+        cmd.Parameters.AddWithValue("$secret", secret);
+        cmd.Parameters.AddWithValue("$created", DateTime.UtcNow.ToString("O"));
+        cmd.Parameters.AddWithValue("$port", port);
+        cmd.ExecuteNonQuery();
+        return Get(id)!;
+    }
+
+    public bool Revoke(string id)
+    {
+        using var db = Open();
+        using var cmd = db.CreateCommand();
+        cmd.CommandText = "UPDATE keys SET revoked_utc=$now WHERE id=$id AND revoked_utc IS NULL";
+        cmd.Parameters.AddWithValue("$now", DateTime.UtcNow.ToString("O"));
+        cmd.Parameters.AddWithValue("$id", id);
+        return cmd.ExecuteNonQuery() > 0;
+    }
+
+    public bool SetPaused(string id, bool paused)
+    {
+        using var db = Open();
+        using var cmd = db.CreateCommand();
+        cmd.CommandText = "UPDATE keys SET paused=$p WHERE id=$id AND revoked_utc IS NULL";
+        cmd.Parameters.AddWithValue("$p", paused ? 1 : 0);
+        cmd.Parameters.AddWithValue("$id", id);
+        return cmd.ExecuteNonQuery() > 0;
+    }
+
+    /// <summary>Lowest backend port not used by any non-revoked key.</summary>
+    public int AllocatePort()
+    {
+        var used = ListKeys().Where(k => k.RevokedUtc == null).Select(k => k.BackendPort).ToHashSet();
+        var port = BasePort + 1;
+        while (used.Contains(port))
+            port++;
+        return port;
+    }
+
+    public static bool SecretLooksValid(string hex) =>
+        hex.Length == 32 && hex.All(char.IsAsciiHexDigit) && hex.Any(c => c != '0');
+
+    private static KeyRecord Read(SqliteDataReader r) => new(
+        r.GetString(0),
+        r.GetString(1),
+        r.GetString(2),
+        DateTime.Parse(r.GetString(3)).ToUniversalTime(),
+        r.IsDBNull(4) ? null : DateTime.Parse(r.GetString(4)).ToUniversalTime(),
+        r.GetInt64(5) != 0,
+        r.GetInt32(6));
+
+    // ---- traffic ------------------------------------------------------------
+
+    public void AggregateTraffic(string keyId, long upDelta, long downDelta, DateOnly? day = null)
+    {
+        if (upDelta == 0 && downDelta == 0)
+            return;
+        var d = (day ?? DateOnly.FromDateTime(DateTime.UtcNow)).ToString("yyyy-MM-dd");
+        using var db = Open();
+        using var cmd = db.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO traffic_daily (day,key_id,up_bytes,down_bytes) VALUES ($day,$key,$up,$down)
+            ON CONFLICT (day,key_id) DO UPDATE SET up_bytes=up_bytes+$up, down_bytes=down_bytes+$down
+            """;
+        cmd.Parameters.AddWithValue("$day", d);
+        cmd.Parameters.AddWithValue("$key", keyId);
+        cmd.Parameters.AddWithValue("$up", upDelta);
+        cmd.Parameters.AddWithValue("$down", downDelta);
+        cmd.ExecuteNonQuery();
+    }
+
+    public sealed record TrafficRow(string KeyId, string Day, long UpBytes, long DownBytes);
+
+    public IReadOnlyList<TrafficRow> Traffic(int lastDays = 7, string? keyId = null)
+    {
+        using var db = Open();
+        using var cmd = db.CreateCommand();
+        cmd.CommandText = keyId == null
+            ? "SELECT key_id,day,up_bytes,down_bytes FROM traffic_daily WHERE day>=$since ORDER BY day,key_id"
+            : "SELECT key_id,day,up_bytes,down_bytes FROM traffic_daily WHERE day>=$since AND key_id=$key ORDER BY day,key_id";
+        cmd.Parameters.AddWithValue("$since", DateOnly.FromDateTime(DateTime.UtcNow.AddDays(-lastDays)).ToString("yyyy-MM-dd"));
+        if (keyId != null)
+            cmd.Parameters.AddWithValue("$key", keyId);
+        using var r = cmd.ExecuteReader();
+        var list = new List<TrafficRow>();
+        while (r.Read())
+            list.Add(new TrafficRow(r.GetString(0), r.GetString(1), r.GetInt64(2), r.GetInt64(3)));
+        return list;
+    }
+
+    // ---- registry export (shared with the MTProxy supervisor) ------------------
+
+    /// <summary>
+    /// Writes registry.txt next to the database atomically: one
+    /// "port:secret_hex" line per active key (the built-in 2398 line comes
+    /// from the environment and is not part of this file).
+    /// </summary>
+    public void ExportRegistry(string builtinSecretHex, int builtinPort = BasePort)
+    {
+        var lines = new List<string> { $"{builtinPort}:{builtinSecretHex}" };
+        foreach (var k in ListKeys(includeRevoked: false).Where(k => k.Active))
+            lines.Add($"{k.BackendPort}:{k.SecretHex}");
+        var path = Path.Combine(DataDirectory, "registry.txt");
+        var tmp = path + ".tmp";
+        File.WriteAllText(tmp, string.Join('\n', lines) + "\n");
+        File.Move(tmp, path, overwrite: true);
+        try { File.WriteAllText(path + ".mode", "0600"); } catch { /* best effort */ }
+    }
+
+    // ---- seed (static operations without the management layer) -----------------
+
+    /// <summary>
+    /// Imports /data/keys/seed.json ([{"name":"ivan","secret_hex":"..."}, ...])
+    /// idempotently by name. Existing keys are left untouched.
+    /// </summary>
+    public IReadOnlyList<KeyRecord> ImportSeed(string seedPath)
+    {
+        if (!File.Exists(seedPath))
+            return [];
+        var imported = new List<KeyRecord>();
+        using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(seedPath));
+        foreach (var el in doc.RootElement.EnumerateArray())
+        {
+            var name = el.TryGetProperty("name", out var n) ? n.GetString() : null;
+            if (string.IsNullOrWhiteSpace(name) || GetByName(name) != null)
+                continue;
+            var secret = el.TryGetProperty("secret_hex", out var s) ? s.GetString() : null;
+            imported.Add(Create(name, string.IsNullOrWhiteSpace(secret) ? null : secret));
+        }
+        return imported;
+    }
+}

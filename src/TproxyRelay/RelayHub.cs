@@ -29,7 +29,12 @@ public sealed class Session
 {
     public required string Token { get; init; }
     public required string CarrierMode { get; init; }
+    public string KeyId { get; init; } = "builtin";
+    public string BackendHostName { get; init; } = "";
+    public int BackendPort { get; init; }
     public IPAddress? ClientIp;                       // accounting address of the first valid create
+    public long UpBytesTotal;                         // per-session, aggregated into the key store
+    public long DownBytesTotal;
     public readonly ConcurrentDictionary<uint, StreamState> Streams = new();
     public readonly ConcurrentDictionary<uint, LaneState> Lanes = new();
     public readonly Channel<FrameBuf> DownQueue;
@@ -118,6 +123,10 @@ public sealed record BootstrapEntry(DateTime Expiry)
     public ulong BodyHash;
     public string? RedeemedToken;
     public IPAddress? Ip;
+    public string KeyId = "builtin";
+    public string BackendHostName = "";
+    public int BackendPort;
+    public string CarrierMode = "https";
 }
 
 public enum RedeemResult { Ok, RetryLater, Invalid }
@@ -130,6 +139,7 @@ public sealed partial class RelayHub
     private readonly RelayOptions _opt;
     private readonly TokenMinter _minter;
     private readonly ILogger _log;
+    private readonly KeyStore? _store;
     private readonly ConcurrentDictionary<string, Session> _sessions = new();
     private readonly ConcurrentDictionary<string, BootstrapEntry> _bootstraps = new();
     private readonly RateBucket _sessionsRate;
@@ -138,11 +148,12 @@ public sealed partial class RelayHub
     private int _streamsGlobal;
     private int _dialsInFlight;
 
-    public RelayHub(RelayOptions opt, TokenMinter minter, ILogger log)
+    public RelayHub(RelayOptions opt, TokenMinter minter, ILogger log, KeyStore? store = null)
     {
         _opt = opt;
         _minter = minter;
         _log = log;
+        _store = store;
         _sessionsRate = new RateBucket(opt.NewSessionsPerMinute, opt.NewSessionsBurst);
         _streamsRate = new RateBucket(opt.NewStreamsPerMinute, opt.NewStreamsBurst);
         _bootstrapsRate = new RateBucket(opt.NewBootstrapsPerMinute, opt.NewBootstrapsBurst);
@@ -150,8 +161,10 @@ public sealed partial class RelayHub
 
     // ---- bootstrap / session lifecycle -------------------------------------
 
-    public string? MintBootstrap(IPAddress? ip = null)
+    public string? MintBootstrap(IPAddress? ip = null, RelayProfile? profile = null)
     {
+        profile ??= new RelayProfile("builtin", "builtin", _opt.Secret,
+            _opt.BackendHostName, _opt.BackendPort, _opt.CarrierMode);
         if (_bootstraps.Count >= _opt.MaxBootstrapsGlobal)
         {
             Counters.LimitHit();
@@ -168,7 +181,14 @@ public sealed partial class RelayHub
             return null;
         }
         var token = _minter.Mint(TokenMinter.KindBootstrap);
-        _bootstraps[token] = new BootstrapEntry(DateTime.UtcNow.AddSeconds(_opt.BootstrapTtlSeconds)) { Ip = ip };
+        _bootstraps[token] = new BootstrapEntry(DateTime.UtcNow.AddSeconds(_opt.BootstrapTtlSeconds))
+        {
+            Ip = ip,
+            KeyId = profile.KeyId,
+            BackendHostName = profile.BackendHostName,
+            BackendPort = profile.BackendPort,
+            CarrierMode = profile.CarrierMode,
+        };
         Counters.BootstrapMinted();
         return token;
     }
@@ -211,7 +231,15 @@ public sealed partial class RelayHub
                 Counters.LimitHit();
                 return RedeemResult.RetryLater; // bootstrap stays unconsumed, retry is byte-identical
             }
-            var created = new Session { Token = _minter.Mint(TokenMinter.KindSession), ClientIp = ip, CarrierMode = _opt.CarrierMode };
+            var created = new Session
+            {
+                Token = _minter.Mint(TokenMinter.KindSession),
+                ClientIp = ip,
+                CarrierMode = entry.CarrierMode,
+                KeyId = entry.KeyId,
+                BackendHostName = entry.BackendHostName,
+                BackendPort = entry.BackendPort,
+            };
             if (created.LanesMode)
                 created.Lanes[0] = new LaneState(0); // session-level lane (PONG traffic)
             _sessions[created.Token] = created;
@@ -240,6 +268,7 @@ public sealed partial class RelayHub
     {
         if (!session.MarkDead())
             return;
+        AggregateTraffic(session); // final flush of the session's per-key deltas
         _sessions.TryRemove(session.Token, out _);
         Counters.SessionActiveDown();
         session.Cts.Cancel();
@@ -261,13 +290,47 @@ public sealed partial class RelayHub
             catch (OperationCanceledException) { break; }
             var now = DateTime.UtcNow;
             foreach (var s in _sessions.Values)
+            {
                 if ((now - s.LastActivity).TotalSeconds > _opt.ReconnectGraceSeconds)
                     CloseSession(s, "idle");
+                AggregateTraffic(s);
+            }
             foreach (var kv in _bootstraps)
                 if (kv.Value.Expiry < now)
                     _bootstraps.TryRemove(kv.Key, out _);
         }
     });
+
+    /// <summary>Flushes per-session byte deltas into the daily per-key aggregates.</summary>
+    private void AggregateTraffic(Session s)
+    {
+        if (_store == null)
+            return;
+        var up = Interlocked.Exchange(ref s.UpBytesTotal, 0);
+        var down = Interlocked.Exchange(ref s.DownBytesTotal, 0);
+        if (up != 0 || down != 0)
+        {
+            try { _store.AggregateTraffic(s.KeyId, up, down); }
+            catch (Exception e)
+            {
+                Interlocked.Add(ref s.UpBytesTotal, up); // not lost: retry next tick
+                Interlocked.Add(ref s.DownBytesTotal, down);
+                _log.LogWarning("event=traffic_aggregate_failed err={Error}", e.Message);
+            }
+        }
+    }
+
+    /// <summary>Closes every live session of one key (revocation path).</summary>
+    public int CloseAllSessionsForKey(string keyId, string reason)
+    {
+        var n = 0;
+        foreach (var s in _sessions.Values.Where(v => v.KeyId == keyId).ToArray())
+        {
+            CloseSession(s, reason);
+            n++;
+        }
+        return n;
+    }
 
     // ---- uplink -------------------------------------------------------------
 
@@ -318,6 +381,7 @@ public sealed partial class RelayHub
             }
             FlushWindowGrants(session);
             Counters.UpBatch(body.Length);
+            Interlocked.Add(ref session.UpBytesTotal, body.Length);
             return new UpResult(UpOutcome.Acked, seq);
         }
         catch (BudgetException)
@@ -496,9 +560,11 @@ public sealed partial class RelayHub
                 dialCts.CancelAfter(TimeSpan.FromSeconds(5));
                 var tcp = new TcpClient();
                 st.Client = tcp;
+                var host = session.BackendHostName.Length > 0 ? session.BackendHostName : _opt.BackendHostName;
+                var port = session.BackendPort > 0 ? session.BackendPort : _opt.BackendPort;
                 try
                 {
-                    await tcp.ConnectAsync(_opt.BackendHostName, _opt.BackendPort, dialCts.Token);
+                    await tcp.ConnectAsync(host, port, dialCts.Token);
                 }
                 catch (Exception e) when (e is OperationCanceledException or SocketException)
                 {
@@ -725,7 +791,7 @@ public sealed partial class RelayHub
         if (replay != null)
         {
             Counters.DownBatch(replay.Length);
-            return DownResult.Batch(replay, session.PendingCursor);
+            return DownResult.Batch(replay, session.PendingCursor); // replay: not re-counted per key
         }
 
         if (!await session.DownCollect.WaitAsync(0))
@@ -807,6 +873,7 @@ public sealed partial class RelayHub
                 newCursor = session.PendingCursor;
             }
             Counters.DownBatch(body.Length);
+            Interlocked.Add(ref session.DownBytesTotal, body.Length);
             return DownResult.Batch(body, newCursor);
         }
         catch (OperationCanceledException)
@@ -872,6 +939,7 @@ public sealed partial class RelayHub
                 ReleaseCharge(session, body.Length, frameCount);
                 _log.LogDebug("event=ws_send bytes={Bytes} frames={Frames}", body.Length, frameCount);
                 Counters.DownBatch(body.Length);
+                Interlocked.Add(ref session.DownBytesTotal, body.Length);
                 await ws.SendAsync(body, WebSocketMessageType.Binary, true, ct);
                 session.Touch(); // ws carrier: activity keeps the idle reaper away
                 _log.LogDebug("event=ws_sent bytes={Bytes}", body.Length);
@@ -919,6 +987,7 @@ public sealed partial class RelayHub
                 }
                 FlushWindowGrants(session);
                 Counters.UpBatch((int)ms.Length);
+                Interlocked.Add(ref session.UpBytesTotal, ms.Length);
             }
         done:;
         }

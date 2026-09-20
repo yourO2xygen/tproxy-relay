@@ -30,7 +30,21 @@ builder.Services.Configure<HostOptions>(o => o.ShutdownTimeout = TimeSpan.FromSe
 var app = builder.Build();
 
 var minter = new TokenMinter(TokenMinter.LoadOrCreateKey(opt.TokenKeyPath));
-var hub = new RelayHub(opt, minter, app.Logger);
+// Managed keys: SQLite registry + seed import + the registry file the
+// MTProxy container supervisor reconciles against. The environment secret
+// remains the built-in profile on the default backend port.
+var store = new KeyStore(opt.KeysDbPath);
+var seeded = store.ImportSeed(Path.Combine(store.DataDirectory, "seed.json"));
+if (seeded.Count > 0)
+    app.Logger.LogInformation("event=keys_seeded count={Count}", seeded.Count);
+store.ExportRegistry(Convert.ToHexString(opt.Secret).ToLowerInvariant());
+var builtinProfile = new RelayProfile("builtin", "builtin", opt.Secret,
+    opt.BackendHostName, opt.BackendPort, opt.CarrierMode);
+var registry = new ProfileRegistry(opt, builtinProfile);
+registry.ReplaceManaged(store.ListKeys(includeRevoked: false).Where(k => k.Active).Select(k =>
+    new RelayProfile(k.Id, k.Name, Convert.FromHexString(k.SecretHex),
+        opt.BackendHostName, k.BackendPort, opt.CarrierMode)));
+var hub = new RelayHub(opt, minter, app.Logger, store);
 var publicContent = PublicContent.Create(opt, app.Logger);
 _ = hub.StartReaper(app.Lifetime.ApplicationStopping);
 // Graceful shutdown: close all sessions so carriers observe a clean end
@@ -145,25 +159,28 @@ app.MapGet(webRoot, async (HttpContext ctx) =>
         await publicContent.NotFoundAsync(ctx);
         return;
     }
-    if (ExactBridgeQuery(ctx, out var value) &&
-        CapabilityDeriver.Matches(value, opt.CapabilityBytes))
+    if (ExactBridgeQuery(ctx, out var value))
     {
-        var bootstrap = hub.MintBootstrap(ctx.Items["ClientIp"] as IPAddress);
-        if (bootstrap == null)
+        var profile = registry.Match(value);
+        if (profile != null)
         {
-            ctx.Response.StatusCode = 503; // bootstrap cap or creation-rate bucket
-            ctx.Response.Headers["Retry-After"] = "2";
+            var bootstrap = hub.MintBootstrap(ctx.Items["ClientIp"] as IPAddress, profile);
+            if (bootstrap == null)
+            {
+                ctx.Response.StatusCode = 503; // bootstrap cap or creation-rate bucket
+                ctx.Response.Headers["Retry-After"] = "2";
+                return;
+            }
+            await BridgePage.Write(ctx, bootstrap, profile.CarrierMode, opt.PublicHostname, opt.BasePath);
             return;
         }
-        await BridgePage.Write(ctx, bootstrap, opt.CarrierMode, opt.PublicHostname, opt.BasePath);
-        return;
     }
     if (opt.BasePath.Length > 0)
     {
         // With a base path the root is not a transport path. An authentic
         // capability offered here fails locally with an uncacheable 404;
         // everything else is the public home page.
-        if (ExactBridgeQuery(ctx, out value))
+        if (ExactBridgeQuery(ctx, out var v2) && registry.Match(v2) != null)
             await publicContent.NotFoundAsync(ctx);
         else
             await publicContent.HomeAsync(ctx);

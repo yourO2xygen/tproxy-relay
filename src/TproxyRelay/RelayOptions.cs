@@ -20,6 +20,7 @@ public sealed class RelayOptions
     public IPAddress? ListenAddress { get; init; }   // null = any interface
     public IPAddress? AdminAddress { get; init; }    // null = any interface
     public string TokenKeyPath { get; init; } = "token.key";
+    public string KeysDbPath { get; init; } = "keys.db";  // SQLite registry of managed keys
     public string PublicDir { get; init; } = "";          // static site, read once at startup
     public string PublicUpstream { get; init; } = "";     // reverse proxy to a loopback app
     public bool StaticRoutesLegacy { get; init; }         // extensionless aliases for the static site
@@ -138,6 +139,7 @@ public sealed class RelayOptions
             PublicUpstream = Ov("public_upstream", env("TPROXY_PUBLIC_UPSTREAM"), ""),
             StaticRoutesLegacy = Ov("static_routes", env("TPROXY_STATIC_ROUTES"), "exact") == "legacy",
             TokenKeyPath = Ov("token_key_file", env("TPROXY_TOKEN_KEY_PATH"), "token.key"),
+            KeysDbPath = Ov("keys_db", env("TPROXY_KEYS_DB"), "keys.db"),
             Secret = secret,
             ListenPort = int.Parse(listen),
             AdminPort = int.Parse(admin),

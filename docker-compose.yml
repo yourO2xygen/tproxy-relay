@@ -25,6 +25,7 @@ services:
       TPROXY_CARRIER_MODE: https
       TPROXY_BASE_PATH: ${TPROXY_BASE_PATH:-}
       TPROXY_TOKEN_KEY_PATH: /data/token.key
+      TPROXY_KEYS_DB: /data/keys.db
     volumes:
       - relay-data:/data
     ports:

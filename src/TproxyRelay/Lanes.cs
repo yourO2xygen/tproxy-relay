@@ -137,6 +137,7 @@ public sealed partial class RelayHub
             }
             FlushWindowGrants(session);
             Counters.UpBatch(body.Length);
+            Interlocked.Add(ref session.UpBytesTotal, body.Length);
             return new LaneUpResult(LaneOutcome.Ok, seq);
         }
         catch (BudgetException)
@@ -291,6 +292,7 @@ public sealed partial class RelayHub
                 newCursor = lane.PendingCursor;
             }
             Counters.DownBatch(body.Length);
+            Interlocked.Add(ref session.DownBytesTotal, body.Length);
             return DownResult.Batch(body, newCursor);
         }
         catch (OperationCanceledException)
@@ -347,6 +349,7 @@ public sealed partial class RelayHub
                     ReturnFrames(frames);
                     ReleaseLaneCharge(session, lane, body.Length, frameCount);
                     Counters.DownBatch(body.Length);
+                    Interlocked.Add(ref session.DownBytesTotal, body.Length);
                     await ws.SendAsync(body, WebSocketMessageType.Binary, true, ct);
                     session.Touch();
                     // Lane fully drained after its stream closed: the socket's
@@ -410,6 +413,7 @@ public sealed partial class RelayHub
                 }
                 FlushWindowGrants(session);
                 Counters.UpBatch((int)ms.Length);
+                Interlocked.Add(ref session.UpBytesTotal, ms.Length);
                 continue;
 
             laneFail:
