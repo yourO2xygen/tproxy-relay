@@ -56,6 +56,19 @@ deploy/production/setup.sh proxy.yourdomain.tld
 `TPROXY_SECRET_HEX` (`openssl rand -hex 16`) и `MTPROXY_PUBLIC_IP`. Секрет можно
 передавать файлом (`TPROXY_SECRET_HEX_FILE`, docker-secrets-стиль) вместо env.
 
+#### config.json (необязательно)
+
+Все лимиты и таймауты настраиваются файлом `config.json` (путь — `TPROXY_CONFIG`,
+по умолчанию рядом с бинарём; пример — `deploy/config.example.json`). Приоритет:
+значения по умолчанию < `config.json` < переменные окружения (`TPROXY_*`).
+Секрет в config.json не принимается — только env/файл. Полная матрица лимитов
+включает rate-корзины (`new_sessions/streams/bootstraps_per_minute` + burst),
+глобальный pending-бюджет (байты и элементы), кап параллельных коннектов к
+бэкенду и опциональные per-IP лимиты (`max_sessions_per_ip`,
+`max_bootstraps_per_ip`, 0 = выключено). Несовместимые значения (например,
+`carrier_batch_bytes > 2 МиБ` или контрольный резерв, не оставляющий места
+данным) приводят к отказу запуска.
+
 ### 3. Контейнеры
 
 ```bash

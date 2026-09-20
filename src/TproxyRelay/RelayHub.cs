@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Net;
 using System.Net.Sockets;
 using System.Net.WebSockets;
 using System.IO.Hashing;
@@ -27,6 +28,7 @@ public sealed class StreamState(uint id)
 public sealed class Session
 {
     public required string Token { get; init; }
+    public IPAddress? ClientIp;                       // accounting address of the first valid create
     public readonly ConcurrentDictionary<uint, StreamState> Streams = new();
     public readonly Channel<FrameBuf> DownQueue;
     public readonly object Sync = new();               // seq/cursor/pending/tombstones
@@ -37,7 +39,9 @@ public sealed class Session
     public long AckedCursor;
     public long PendingCursor;
     public byte[]? PendingBatch;
-    public long PendingBytes;
+    public int PendingBatchFrames;
+    public long PendingBytes;                          // charged bytes incl. per-item overhead
+    public int PendingItems;
     public int UpInFlight;
     public CancellationTokenSource? ActivePoll;
     public readonly SemaphoreSlim DownCollect = new(1, 1);
@@ -99,42 +103,69 @@ public sealed record BootstrapEntry(DateTime Expiry)
 {
     public ulong BodyHash;
     public string? RedeemedToken;
+    public IPAddress? Ip;
 }
 
 public enum RedeemResult { Ok, RetryLater, Invalid }
 
 public sealed class RelayHub
 {
+    /// <summary>Conservative per-item charge on top of encoded frame bytes.</summary>
+    public const int ItemOverhead = 256;
+
     private readonly RelayOptions _opt;
     private readonly TokenMinter _minter;
     private readonly ILogger _log;
     private readonly ConcurrentDictionary<string, Session> _sessions = new();
     private readonly ConcurrentDictionary<string, BootstrapEntry> _bootstraps = new();
+    private readonly RateBucket _sessionsRate;
+    private readonly RateBucket _streamsRate;
+    private readonly RateBucket _bootstrapsRate;
     private int _streamsGlobal;
+    private int _dialsInFlight;
 
     public RelayHub(RelayOptions opt, TokenMinter minter, ILogger log)
     {
         _opt = opt;
         _minter = minter;
         _log = log;
+        _sessionsRate = new RateBucket(opt.NewSessionsPerMinute, opt.NewSessionsBurst);
+        _streamsRate = new RateBucket(opt.NewStreamsPerMinute, opt.NewStreamsBurst);
+        _bootstrapsRate = new RateBucket(opt.NewBootstrapsPerMinute, opt.NewBootstrapsBurst);
     }
 
     // ---- bootstrap / session lifecycle -------------------------------------
 
-    public string? MintBootstrap()
+    public string? MintBootstrap(IPAddress? ip = null)
     {
         if (_bootstraps.Count >= _opt.MaxBootstrapsGlobal)
         {
             Counters.LimitHit();
             return null; // cap outstanding bootstraps: unauthenticated minting must not grow memory
         }
+        if (!_bootstrapsRate.TryTake())
+        {
+            Counters.LimitHit();
+            return null;
+        }
+        if (_opt.MaxBootstrapsPerIp > 0 && CountBootstrapsForIp(ip) >= _opt.MaxBootstrapsPerIp)
+        {
+            Counters.LimitHit();
+            return null;
+        }
         var token = _minter.Mint(TokenMinter.KindBootstrap);
-        _bootstraps[token] = new BootstrapEntry(DateTime.UtcNow.AddSeconds(_opt.BootstrapTtlSeconds));
+        _bootstraps[token] = new BootstrapEntry(DateTime.UtcNow.AddSeconds(_opt.BootstrapTtlSeconds)) { Ip = ip };
         Counters.BootstrapMinted();
         return token;
     }
 
-    public RedeemResult TryRedeemBootstrap(string token, byte[] body, out Session? session)
+    private int CountBootstrapsForIp(IPAddress? ip) =>
+        ip == null ? 0 : _bootstraps.Values.Count(b => ip.Equals(b.Ip));
+
+    private int CountSessionsForIp(IPAddress? ip) =>
+        ip == null ? 0 : _sessions.Values.Count(s => ip.Equals(s.ClientIp));
+
+    public RedeemResult TryRedeemBootstrap(string token, byte[] body, IPAddress? ip, out Session? session)
     {
         session = null;
         if (!_minter.TryValidate(token, TokenMinter.KindBootstrap))
@@ -159,12 +190,14 @@ public sealed class RelayHub
                 session = existing;
                 return RedeemResult.Ok;
             }
-            if (_sessions.Count >= _opt.MaxSessionsGlobal)
+            if (_sessions.Count >= _opt.MaxSessionsGlobal ||
+                !_sessionsRate.TryTake() ||
+                (_opt.MaxSessionsPerIp > 0 && CountSessionsForIp(ip) >= _opt.MaxSessionsPerIp))
             {
                 Counters.LimitHit();
-                return RedeemResult.RetryLater;
+                return RedeemResult.RetryLater; // bootstrap stays unconsumed, retry is byte-identical
             }
-            var created = new Session { Token = _minter.Mint(TokenMinter.KindSession) };
+            var created = new Session { Token = _minter.Mint(TokenMinter.KindSession), ClientIp = ip };
             _sessions[created.Token] = created;
             Counters.SessionCreated();
             Counters.SessionActiveUp();
@@ -212,7 +245,7 @@ public sealed class RelayHub
             catch (OperationCanceledException) { break; }
             var now = DateTime.UtcNow;
             foreach (var s in _sessions.Values)
-                if ((now - s.LastActivity).TotalSeconds > _opt.SessionIdleTtlSeconds)
+                if ((now - s.LastActivity).TotalSeconds > _opt.ReconnectGraceSeconds)
                     CloseSession(s, "idle");
             foreach (var kv in _bootstraps)
                 if (kv.Value.Expiry < now)
@@ -244,7 +277,7 @@ public sealed class RelayHub
                     return new UpResult(UpOutcome.Fatal, seq, "sequence gap");
             }
 
-            frames = FrameCodec.ParseAll(body);
+            frames = FrameCodec.ParseAll(body, _opt.MaxFramePayload);
             foreach (var f in frames)
                 if (!FrameCodec.IsValidClientFrame(f))
                     return new UpResult(UpOutcome.Fatal, seq, $"invalid frame type={f.Type:X2} stream={f.StreamId}");
@@ -323,8 +356,15 @@ public sealed class RelayHub
             throw new FrameException("OPEN on stream zero");
         if (session.Streams.ContainsKey(id) || session.IsTombstoned(id))
             throw new FrameException($"stream id {id} reused");
-        if (session.Streams.Count >= _opt.MaxStreamsPerSession ||
-            Interlocked.Increment(ref _streamsGlobal) > _opt.MaxStreamsGlobal)
+        if (session.Streams.Count >= _opt.MaxStreamsPerSession || !_streamsRate.TryTake())
+        {
+            Counters.LimitHit();
+            // Capacity or creation-rate rejection is stream-scoped: the session
+            // and its other streams stay alive (PROTOCOL.md).
+            await EnqueueDownAsync(session, FrameBuf.Buy(FrameCodec.Encode(FrameType.Close, id)));
+            return;
+        }
+        if (Interlocked.Increment(ref _streamsGlobal) > _opt.MaxStreamsGlobal)
         {
             Interlocked.Decrement(ref _streamsGlobal);
             Counters.LimitHit();
@@ -426,20 +466,39 @@ public sealed class RelayHub
     {
         try
         {
-            using var dialCts = CancellationTokenSource.CreateLinkedTokenSource(session.Cts.Token);
-            dialCts.CancelAfter(TimeSpan.FromSeconds(5));
-            var tcp = new TcpClient();
-            st.Client = tcp;
-            Counters.DialInFlight(1);
+            if (Interlocked.Increment(ref _dialsInFlight) > _opt.MaxBackendDialsInFlight)
+            {
+                Interlocked.Decrement(ref _dialsInFlight);
+                Counters.LimitHit();
+                st.Connected.TrySetCanceled(); // this stream dies, the session survives
+                return;
+            }
+            Counters.DialInFlightSet(_dialsInFlight);
             try
             {
-                await tcp.ConnectAsync(_opt.BackendHostName, _opt.BackendPort, dialCts.Token);
+                using var dialCts = CancellationTokenSource.CreateLinkedTokenSource(session.Cts.Token);
+                dialCts.CancelAfter(TimeSpan.FromSeconds(5));
+                var tcp = new TcpClient();
+                st.Client = tcp;
+                try
+                {
+                    await tcp.ConnectAsync(_opt.BackendHostName, _opt.BackendPort, dialCts.Token);
+                }
+                catch (Exception e) when (e is OperationCanceledException or SocketException)
+                {
+                    try { tcp.Close(); } catch { /* ignore */ }
+                    throw;
+                }
+                tcp.NoDelay = true; // small MTProto packets must not wait in Nagle
+                st.Net = tcp.GetStream();
+                st.Connected.TrySetResult();
+                _log.LogDebug("event=backend_connected id={Id}", st.Id);
             }
-            finally { Counters.DialInFlight(-1); }
-            tcp.NoDelay = true; // small MTProto packets must not wait in Nagle
-            st.Net = tcp.GetStream();
-            st.Connected.TrySetResult();
-            _log.LogDebug("event=backend_connected id={Id}", st.Id);
+            finally
+            {
+                Interlocked.Decrement(ref _dialsInFlight);
+                Counters.DialInFlightSet(_dialsInFlight);
+            }
 
             var buf = new byte[FrameCodec.DataChunk];
             while (!st.Closed && !session.Cts.IsCancellationRequested)
@@ -493,16 +552,25 @@ public sealed class RelayHub
             frame.Return();
             return;
         }
-        Interlocked.Add(ref session.PendingBytes, frame.Length);
+        var charge = frame.Length + ItemOverhead;
+        Interlocked.Add(ref session.PendingBytes, charge);
+        Interlocked.Increment(ref session.PendingItems);
+        Counters.PendingBytes(charge);
+        Counters.PendingItems(1);
         Counters.FramesOut(1);
-        Counters.PendingBytes(frame.Length);
-        // Downlink byte gate: a client that grants WINDOW but never drains its
-        // down queue must not grow relay memory without bound.
+        // Downlink gates: a client that grants WINDOW but never drains its down
+        // queue must not grow relay memory without bound — per session and
+        // process-wide (bytes and item counts).
         if (Interlocked.Read(ref session.PendingBytes) >
-            _opt.MaxPendingBytesPerSession + _opt.DownBatchTargetBytes)
+                _opt.MaxPendingBytesPerSession + _opt.DownBatchTargetBytes ||
+            Counters.PendingBytesGauge > _opt.MaxPendingBytesGlobal ||
+            Counters.PendingItemsGauge > _opt.MaxPendingItemsGlobal)
         {
             Counters.LimitHit();
-            Counters.PendingBytes(-frame.Length);
+            Counters.PendingBytes(-charge);
+            Counters.PendingItems(-1);
+            Interlocked.Add(ref session.PendingBytes, -charge);
+            Interlocked.Decrement(ref session.PendingItems);
             frame.Return();
             CloseSession(session, "downlink budget");
             return;
@@ -512,8 +580,18 @@ public sealed class RelayHub
         // per-stream frame order. No fire-and-forget fallback: that reordered
         // frames and grew an unbounded task backlog.
         try { await session.DownQueue.Writer.WriteAsync(frame, session.Cts.Token); }
-        catch (ChannelClosedException) { Counters.PendingBytes(-frame.Length); frame.Return(); }
-        catch (OperationCanceledException) { Counters.PendingBytes(-frame.Length); frame.Return(); }
+        catch (ChannelClosedException) { ReleaseCharge(session, frame.Length, 1); frame.Return(); }
+        catch (OperationCanceledException) { ReleaseCharge(session, frame.Length, 1); frame.Return(); }
+    }
+
+    /// <summary>Releases the byte+item charge of drained frames.</summary>
+    private static void ReleaseCharge(Session session, int encodedBytes, int items)
+    {
+        var release = encodedBytes + items * ItemOverhead;
+        Interlocked.Add(ref session.PendingBytes, -release);
+        Interlocked.Add(ref session.PendingItems, -items);
+        Counters.PendingBytes(-release);
+        Counters.PendingItems(-items);
     }
 
     /// <summary>Flush coalesced WINDOW credits into the down queue.</summary>
@@ -550,10 +628,10 @@ public sealed class RelayHub
                 replay = null;
                 if (cursor == session.PendingCursor && session.PendingBatch != null)
                 {
-                    // Client acknowledged the pending batch.
+                    // Client acknowledged the pending batch: charges are held
+                    // until this cursor acknowledges them (PROTOCOL.md).
                     session.AckedCursor = cursor;
-                    Interlocked.Add(ref session.PendingBytes, -session.PendingBatch.Length);
-                    Counters.PendingBytes(-session.PendingBatch.Length);
+                    ReleaseCharge(session, session.PendingBatch.Length, session.PendingBatchFrames);
                     session.PendingBatch = null;
                 }
             }
@@ -625,6 +703,7 @@ public sealed class RelayHub
                 return DownResult.Empty(cursor);
             }
 
+            var frameCount = frames.Count;
             var body = new byte[bytes];
             var off = 0;
             foreach (var f in frames)
@@ -638,6 +717,7 @@ public sealed class RelayHub
             {
                 session.PendingCursor = session.AckedCursor + 1;
                 session.PendingBatch = body;
+                session.PendingBatchFrames = frameCount;
                 newCursor = session.PendingCursor;
             }
             Counters.DownBatch(body.Length);
@@ -692,6 +772,7 @@ public sealed class RelayHub
                         break;
                     continue;
                 }
+                var frameCount = frames.Count;
                 var body = new byte[bytes];
                 var off = 0;
                 foreach (var f in frames)
@@ -700,7 +781,10 @@ public sealed class RelayHub
                     off += f.Length;
                 }
                 ReturnFrames(frames);
-                _log.LogDebug("event=ws_send bytes={Bytes} frames={Frames}", body.Length, frames.Count);
+                // WS drain releases the charge immediately: no cursor replay
+                // exists on this carrier, so delivery == acknowledgement.
+                ReleaseCharge(session, body.Length, frameCount);
+                _log.LogDebug("event=ws_send bytes={Bytes} frames={Frames}", body.Length, frameCount);
                 Counters.DownBatch(body.Length);
                 await ws.SendAsync(body, WebSocketMessageType.Binary, true, ct);
                 session.Touch(); // ws carrier: activity keeps the idle reaper away
@@ -728,7 +812,7 @@ public sealed class RelayHub
                 }
                 while (!result.EndOfMessage);
 
-                var frames = FrameCodec.ParseAll(ms.GetBuffer().AsMemory(0, (int)ms.Length));
+                var frames = FrameCodec.ParseAll(ms.GetBuffer().AsMemory(0, (int)ms.Length), _opt.MaxFramePayload);
                 foreach (var f in frames)
                     if (!FrameCodec.IsValidClientFrame(f))
                         goto done;

@@ -16,8 +16,10 @@ builder.Logging.AddSimpleConsole(o =>
 builder.Logging.AddFilter("Microsoft.AspNetCore", LogLevel.Warning);
 builder.WebHost.ConfigureKestrel(k =>
 {
-    k.ListenAnyIP(opt.ListenPort);
-    k.ListenAnyIP(opt.AdminPort);
+    if (opt.ListenAddress is { } la) k.Listen(la, opt.ListenPort);
+    else k.ListenAnyIP(opt.ListenPort);
+    if (opt.AdminAddress is { } aa) k.Listen(aa, opt.AdminPort);
+    else k.ListenAnyIP(opt.AdminPort);
     k.Limits.MaxRequestBodySize = 4 * 1024 * 1024;
     k.Limits.MaxRequestLineSize = 16 * 1024;
     k.Limits.MaxConcurrentConnections = 256;
@@ -66,8 +68,38 @@ app.Use(async (ctx, next) =>
                 return;
         }
     }
+    // Carrier surface hygiene (PROTOCOL.md): HTTP API requests carry no
+    // cookies, and capacity accounting needs exactly one client address.
+    if (ctx.Request.Path.StartsWithSegments("/api/v1"))
+    {
+        if (ctx.Request.Headers.ContainsKey("Cookie"))
+        {
+            ctx.Response.StatusCode = 400;
+            return;
+        }
+    }
+    var ip = ClientIp(ctx);
+    if (ip is null)
+    {
+        // X-Forwarded-For carried a list or an unparsable value.
+        ctx.Response.StatusCode = 400;
+        return;
+    }
+    ctx.Items["ClientIp"] = ip;
     await next();
 });
+
+/// <summary>
+/// Exactly one accounting address: a single X-Forwarded-For value when present
+/// (a list is rejected — the front proxy must not append), else the socket peer.
+/// </summary>
+static IPAddress? ClientIp(HttpContext ctx)
+{
+    var xff = ctx.Request.Headers["X-Forwarded-For"].ToString();
+    if (xff.Length == 0)
+        return ctx.Connection.RemoteIpAddress;
+    return IPAddress.TryParse(xff.Trim(), out var ip) ? ip : null;
+}
 
 bool HostOk(HttpContext ctx) =>
     !opt.RequireHost ||
@@ -101,10 +133,10 @@ app.MapGet("/", async (HttpContext ctx) =>
     var value = exact ? q["bridge"].ToString() : "";
     if (exact && value.Length == 43 && CapabilityDeriver.Matches(value, opt.CapabilityBytes))
     {
-        var bootstrap = hub.MintBootstrap();
+        var bootstrap = hub.MintBootstrap(ctx.Items["ClientIp"] as IPAddress);
         if (bootstrap == null)
         {
-            ctx.Response.StatusCode = 503; // outstanding bootstrap cap
+            ctx.Response.StatusCode = 503; // bootstrap cap or creation-rate bucket
             ctx.Response.Headers["Retry-After"] = "2";
             return;
         }
@@ -148,7 +180,7 @@ app.MapPost("/api/v1/session", async (HttpContext ctx) =>
         ctx.Response.StatusCode = 400;
         return;
     }
-    switch (hub.TryRedeemBootstrap(token, body, out var session))
+    switch (hub.TryRedeemBootstrap(token, body, ctx.Items["ClientIp"] as IPAddress, out var session))
     {
         case RedeemResult.Ok when session != null:
             ctx.Response.StatusCode = 200;

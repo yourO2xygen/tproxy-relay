@@ -79,7 +79,7 @@ public static class FrameCodec
     }
 
     /// <summary>Zero-copy parse: frame payloads are slices of the input body.</summary>
-    public static List<Frame> ParseAll(ReadOnlyMemory<byte> input)
+    public static List<Frame> ParseAll(ReadOnlyMemory<byte> input, int maxPayload = MaxPayload)
     {
         var frames = new List<Frame>(4);
         var span = input.Span;
@@ -91,7 +91,7 @@ public static class FrameCodec
             if (span.Length - offset < HeaderSize)
                 throw new FrameException("incomplete frame header");
             var length = BinaryPrimitives.ReadUInt32BigEndian(span.Slice(offset + 4, 4));
-            if (length > MaxPayload)
+            if (length > maxPayload)
                 throw new FrameException("frame payload exceeds limit");
             var full = HeaderSize + (int)length;
             if (full > span.Length - offset)
