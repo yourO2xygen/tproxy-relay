@@ -23,6 +23,7 @@ services:
       TPROXY_SECRET_HEX: "000102030405060708090a0b0c0d0e0f"
       TPROXY_BACKEND_HOST: backend-stub:9000
       TPROXY_CARRIER_MODE: https
+      TPROXY_BASE_PATH: ${TPROXY_BASE_PATH:-}
       TPROXY_TOKEN_KEY_PATH: /data/token.key
     volumes:
       - relay-data:/data

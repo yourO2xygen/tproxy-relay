@@ -12,6 +12,7 @@ namespace TproxyRelay;
 public sealed class RelayOptions
 {
     public string PublicHostname { get; init; } = "proxy.example.com";
+    public string BasePath { get; init; } = "";     // "" = root deployment
     public string BackendHost { get; init; } = "backend-stub:9000";
     public string CarrierMode { get; init; } = "https"; // https | websocket
     public int ListenPort { get; init; } = 8080;
@@ -59,7 +60,7 @@ public sealed class RelayOptions
     }
 
     public byte[] CapabilityBytes =>
-        Base64Url.DecodeFromChars(CapabilityDeriver.Derive(PublicHostname, Secret));
+        Base64Url.DecodeFromChars(CapabilityDeriver.Derive(PublicHostname, Secret, BasePath));
 
     // ---------------------------------------------------------------- load ----
 
@@ -128,6 +129,7 @@ public sealed class RelayOptions
         var opt = new RelayOptions(Ov("backend", env("TPROXY_BACKEND_HOST"), "backend-stub:9000"))
         {
             PublicHostname = Ov("public_hostname", env("TPROXY_PUBLIC_HOSTNAME"), "proxy.example.com").ToLowerInvariant(),
+            BasePath = Ov("base_path", env("TPROXY_BASE_PATH"), "").Trim('/'),
             CarrierMode = Ov("carrier_mode", env("TPROXY_CARRIER_MODE"), "https"),
             TokenKeyPath = Ov("token_key_file", env("TPROXY_TOKEN_KEY_PATH"), "token.key"),
             Secret = secret,
@@ -164,6 +166,9 @@ public sealed class RelayOptions
 
     private void Validate()
     {
+        if (!BasePaths.IsValid(BasePath))
+            throw new InvalidOperationException(
+                "base_path must be one or more '/'-separated segments of [A-Za-z0-9][A-Za-z0-9_-]*, at most 128 characters");
         if (CarrierMode is not ("https" or "websocket" or "https-lanes" or "websocket-lanes"))
             throw new InvalidOperationException($"unsupported carrier mode {CarrierMode}");
         // 2 MiB is the desktop client's loopback-fallback message cap.

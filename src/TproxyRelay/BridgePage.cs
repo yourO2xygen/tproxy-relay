@@ -14,6 +14,7 @@ public static class BridgePage
 (function(){
 'use strict';
 var MODE='{{MODE}}';
+var BASE='{{BASE}}';
 var LANES=(MODE==='https-lanes'||MODE==='websocket-lanes');
 var UP_LIMIT=2*1024*1024;
 var PENDING_LIMIT=32*1024*1024;
@@ -32,7 +33,7 @@ var batchMode=false;   // loopback MessagePort boundary expects complete carrier
 var nonce=null;
 var m=location.hash.match(/^#android=([A-Za-z0-9_-]+)/);
 if(m)nonce=m[1];
-history.replaceState(null,'','/');
+history.replaceState(null,'',location.pathname);
 
 function sleep(ms){return new Promise(function(r){setTimeout(r,ms);});}
 
@@ -149,7 +150,7 @@ function onClientValue(v){
     
     stopped=true;
     if(sessionToken){
-      try{fetch('/api/v1/session',{method:'DELETE',mode:'same-origin',credentials:'omit',cache:'no-store',redirect:'error',headers:{'Authorization':'Bearer '+sessionToken},keepalive:true});}catch(e){}
+      try{fetch(BASE+'api/v1/session',{method:'DELETE',mode:'same-origin',credentials:'omit',cache:'no-store',redirect:'error',headers:{'Authorization':'Bearer '+sessionToken},keepalive:true});}catch(e){}
     }
     return;
   }
@@ -214,7 +215,7 @@ async function createSession(){
   }else{
     hello=await takeFirst();
   }
-  var r=await post('/api/v1/session',
+  var r=await post(BASE+'api/v1/session',
     {'Authorization':'Bearer '+'{{BOOTSTRAP}}','Content-Type':'application/octet-stream'},hello);
   if(!r.ok)throw new Error('session create failed: '+r.status);
   sessionToken=r.headers.get('X-Session-Token');
@@ -234,7 +235,7 @@ async function upLoop(tok){
       if(stopped)return;
       var r;
       try{
-        r=await post('/api/v1/up',
+        r=await post(BASE+'api/v1/up',
           {'Authorization':'Bearer '+tok,'Content-Type':'application/octet-stream','X-Up-Seq':String(seq)},body);
       }catch(e){await sleep(500);continue;}
       if(r.status===204){seq++;break;}
@@ -250,7 +251,7 @@ async function downLoop(tok,cursor0){
     if(stopped)return;
     var r;
     try{
-      r=await post('/api/v1/down',
+      r=await post(BASE+'api/v1/down',
         {'Authorization':'Bearer '+tok,'X-Down-Cursor':String(cursor)},new Uint8Array(0));
     }catch(e){await sleep(500);continue;}
     if(r.status===204)continue;
@@ -281,7 +282,7 @@ function laneUpLoop(tok,sid){
         if(stopped||L.closed)return;
         var r;
         try{
-          r=await post('/api/v1/up',
+          r=await post(BASE+'api/v1/up',
             {'Authorization':'Bearer '+tok,'Content-Type':'application/octet-stream',
              'X-Up-Seq':String(L.seq),'X-Lane-ID':String(sid)},body);
         }catch(e){await sleep(500);continue;}
@@ -301,7 +302,7 @@ function laneDownLoop(tok,sid){
       if(sid>0&&L.closed)return;
       var r;
       try{
-        r=await post('/api/v1/down',
+        r=await post(BASE+'api/v1/down',
           {'Authorization':'Bearer '+tok,'X-Down-Cursor':String(L.cursor),'X-Lane-ID':String(sid)},
           new Uint8Array(0));
       }catch(e){await sleep(500);continue;}
@@ -344,7 +345,7 @@ async function httpsLanesLoop(tok){
 // ---- websocket / websocket-lanes ------------------------------------------
 
 async function wsLoop(tok){
-  var ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/api/v1/ws','tproxy-v1.'+tok);
+  var ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+BASE+'api/v1/ws','tproxy-v1.'+tok);
   ws.binaryType='arraybuffer';
   ws.onmessage=function(ev){
     if(typeof ev.data==='string')return;
@@ -368,7 +369,7 @@ async function wsLoop(tok){
 function wsLane(tok,sid){
   var L=lane(sid);
   return (async function(){
-    var ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/api/v1/ws',
+    var ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+BASE+'api/v1/ws',
       'tproxy-lane-v1.'+tok+'.'+String(sid));
     L.ws=ws;
     ws.binaryType='arraybuffer';
@@ -459,13 +460,14 @@ start();
 </html>
 """;
 
-    public static async Task Write(HttpContext ctx, string bootstrap, string mode, string hostname)
+    public static async Task Write(HttpContext ctx, string bootstrap, string mode, string hostname, string basePath = "")
     {
         var nonce = Base64Url.EncodeToString(RandomNumberGenerator.GetBytes(16));
         var html = Template
             .Replace("{{NONCE}}", nonce)
             .Replace("{{BOOTSTRAP}}", bootstrap)
-            .Replace("{{MODE}}", mode);
+            .Replace("{{MODE}}", mode)
+            .Replace("{{BASE}}", BasePaths.WebPath(basePath));
 
         ctx.Response.StatusCode = 200;
         ctx.Response.ContentType = "text/html; charset=utf-8";

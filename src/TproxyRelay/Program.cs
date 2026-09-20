@@ -105,6 +105,21 @@ bool HostOk(HttpContext ctx) =>
     !opt.RequireHost ||
     string.Equals(ctx.Request.Host.Host, opt.PublicHostname, StringComparison.OrdinalIgnoreCase);
 
+// Base-path routing (BASE_PATH.md): at the root the web path is "/", with a
+// prefix every transport endpoint moves under "/<base>/". Only the
+// trailing-slash form is served; "/<base>" without the slash is not
+// special-cased and gets the ordinary public 404.
+var webRoot = BasePaths.WebPath(opt.BasePath);
+bool ExactBridgeQuery(HttpContext ctx, out string value)
+{
+    value = "";
+    var q = ctx.Request.Query;
+    if (!(q.Count == 1 && q.ContainsKey("bridge") && q["bridge"].Count == 1))
+        return false;
+    value = q["bridge"].ToString();
+    return value.Length == 43;
+}
+
 static string? Bearer(HttpContext ctx)
 {
     var auth = ctx.Request.Headers.Authorization.ToString();
@@ -121,17 +136,15 @@ static string? Bearer(HttpContext ctx)
 
 // -- public root: bridge selection or ordinary site -------------------------
 
-app.MapGet("/", async (HttpContext ctx) =>
+app.MapGet(webRoot, async (HttpContext ctx) =>
 {
     if (!HostOk(ctx))
     {
         await PublicSite.NotFound(ctx);
         return;
     }
-    var q = ctx.Request.Query;
-    var exact = q.Count == 1 && q.ContainsKey("bridge") && q["bridge"].Count == 1;
-    var value = exact ? q["bridge"].ToString() : "";
-    if (exact && value.Length == 43 && CapabilityDeriver.Matches(value, opt.CapabilityBytes))
+    if (ExactBridgeQuery(ctx, out var value) &&
+        CapabilityDeriver.Matches(value, opt.CapabilityBytes))
     {
         var bootstrap = hub.MintBootstrap(ctx.Items["ClientIp"] as IPAddress);
         if (bootstrap == null)
@@ -140,7 +153,18 @@ app.MapGet("/", async (HttpContext ctx) =>
             ctx.Response.Headers["Retry-After"] = "2";
             return;
         }
-        await BridgePage.Write(ctx, bootstrap, opt.CarrierMode, opt.PublicHostname);
+        await BridgePage.Write(ctx, bootstrap, opt.CarrierMode, opt.PublicHostname, opt.BasePath);
+        return;
+    }
+    if (opt.BasePath.Length > 0)
+    {
+        // With a base path the root is not a transport path. An authentic
+        // capability offered here fails locally with an uncacheable 404;
+        // everything else is the public home page.
+        if (ExactBridgeQuery(ctx, out value))
+            await PublicSite.NotFound(ctx);
+        else
+            await PublicSite.Index(ctx);
         return;
     }
     await PublicSite.Index(ctx); // missing/wrong/augmented bridge query: same home page
@@ -148,7 +172,7 @@ app.MapGet("/", async (HttpContext ctx) =>
 
 // -- carrier API -------------------------------------------------------------
 
-app.MapPost("/api/v1/session", async (HttpContext ctx) =>
+app.MapPost(webRoot + "api/v1/session", async (HttpContext ctx) =>
 {
     if (!HostOk(ctx))
     {
@@ -202,7 +226,7 @@ app.MapPost("/api/v1/session", async (HttpContext ctx) =>
     }
 });
 
-app.MapPost("/api/v1/up", async (HttpContext ctx) =>
+app.MapPost(webRoot + "api/v1/up", async (HttpContext ctx) =>
 {
     if (!HostOk(ctx))
     {
@@ -272,7 +296,7 @@ app.MapPost("/api/v1/up", async (HttpContext ctx) =>
     }
 });
 
-app.MapPost("/api/v1/down", async (HttpContext ctx) =>
+app.MapPost(webRoot + "api/v1/down", async (HttpContext ctx) =>
 {
     if (!HostOk(ctx))
     {
@@ -321,7 +345,7 @@ app.MapPost("/api/v1/down", async (HttpContext ctx) =>
     await ctx.Response.Body.WriteAsync(result.Body);
 });
 
-app.MapDelete("/api/v1/session", async (HttpContext ctx) =>
+app.MapDelete(webRoot + "api/v1/session", async (HttpContext ctx) =>
 {
     if (!HostOk(ctx))
     {
@@ -338,7 +362,7 @@ app.MapDelete("/api/v1/session", async (HttpContext ctx) =>
     ctx.Response.StatusCode = 204;
 });
 
-app.MapGet("/api/v1/ws", async (HttpContext ctx) =>
+app.MapGet(webRoot + "api/v1/ws", async (HttpContext ctx) =>
 {
     if (!ctx.WebSockets.IsWebSocketRequest || !HostOk(ctx))
     {

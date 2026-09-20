@@ -20,6 +20,9 @@ services:
       TPROXY_SECRET_HEX_FILE: ${TPROXY_SECRET_HEX_FILE:-}
       TPROXY_BACKEND_HOST: mtproxy:2398
       TPROXY_CARRIER_MODE: ${TPROXY_CARRIER_MODE:-https}
+      # Пусто = прокси в корне хоста; со слагом все пути переезжают под /<base>/
+      # иcapability выводится из host+path (ссылка использует маркированный секрет).
+      TPROXY_BASE_PATH: ${TPROXY_BASE_PATH:-}
       TPROXY_TOKEN_KEY_PATH: /data/token.key
     volumes:
       - relay-data:/data
