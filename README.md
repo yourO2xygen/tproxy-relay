@@ -56,6 +56,67 @@ deploy/production/setup.sh proxy.yourdomain.tld
 `TPROXY_SECRET_HEX` (`openssl rand -hex 16`) и `MTPROXY_PUBLIC_IP`. Секрет можно
 передавать файлом (`TPROXY_SECRET_HEX_FILE`, docker-secrets-стиль) вместо env.
 
+#### config.json (необязательно)
+
+Все лимиты и таймауты настраиваются файлом `config.json` (путь — `TPROXY_CONFIG`,
+по умолчанию рядом с бинарём; пример — `deploy/config.example.json`). Приоритет:
+значения по умолчанию < `config.json` < переменные окружения (`TPROXY_*`).
+Секрет в config.json не принимается — только env/файл. Полная матрица лимитов
+включает rate-корзины (`new_sessions/streams/bootstraps_per_minute` + burst),
+глобальный pending-бюджет (байты и элементы), кап параллельных коннектов к
+бэкенду и опциональные per-IP лимиты (`max_sessions_per_ip`,
+`max_bootstraps_per_ip`, 0 = выключено). Несовместимые значения (например,
+`carrier_batch_bytes > 2 МиБ` или контрольный резерв, не оставляющий места
+данным) приводят к отказу запуска.
+
+#### Base path (необязательно)
+
+Релей может жить под префиксом пути: `https://proxy.example.com/<слаг>/` —
+тогда обычный сайт на хосте остаётся нетронутым, а сканеры не видят
+прокси-поверхность в корне. Слаг — 16 символов base32 (генерирует `setup.sh`
+по умолчанию; `--base-path none` = корень). Capability выводится из
+`host+path` (контекст v2), а ссылки для клиентов используют **маркированный**
+секрет `base64url(0x70 || секрет)` — старые клиенты такой ссылке откажут
+явно, а не попробуют подключиться к пустому хосту. `setup.sh` печатает
+готовые `t.me`/`tg://` ссылки. Смена префикса меняет все capability —
+это перевыпуск: клиенту нужен новый адрес и новый секрет.
+
+```bash
+deploy/production/setup.sh proxy.yourdomain.tld --show --base-path myslug
+# Сервер:  proxy.yourdomain.tld/myslug
+# Секрет:  <маркированный base64url>
+```
+
+### Управление ключами (опционально)
+
+Ключи живут в SQLite (`/data/keys.db` на volume релея). Каждый ключ — свой
+клиентский секрет и **свой процесс MTProxy** в общем контейнере (супервизор
+читает `registry.txt` из volume). Встроенный env-секрет продолжает работать
+на порту 2398 независимо от управляемых ключей. Ревок/пауза мгновенно
+закрывает сессии ключа; трафик агрегируется по ключам и дням.
+
+Три способа управления — все опциональны, по умолчанию всё выключено
+(fail-closed: включено без обязательных параметров = отказ запуска):
+
+| Способ | Включение | Доступ |
+|---|---|---|
+| **Static** (без управления) | ничего | seed-файл `/data/keys/seed.json` (`[{"name":"ivan","secret_hex":"..."}]`), импорт при старте |
+| **Admin API** | `TPROXY_API_ENABLED=true` + `TPROXY_API_TOKEN` | loopback `:8081/admin/*`, Bearer-токен (ssh-туннель): `/admin/stats`, `/admin/keys` (CRUD, `?reveal=1` — показать секреты), `/admin/sessions`, `/admin/traffic?days=N` |
+| **Telegram-бот** | `TPROXY_BOT_ENABLED=true` + `TPROXY_BOT_TOKEN` + `TPROXY_BOT_ADMINS` | команды `/stats /keys /key <имя> /revoke /pause /resume /traffic` — только из админ-чатов |
+
+Бот выдаёт ключ вместе с готовой `t.me`-ссылкой (учитывает base path и
+маркированный секрет).
+
+### Ops
+
+- Статистика MTProxy (встроенный порт): `docker exec tproxy-mtproxy curl -s 127.0.0.1:8888/stats`
+- Метрики релея: `curl 127.0.0.1:8081/metrics` (внутри сервера)
+- Роутинг-конфиг MTProxy (`proxy-multi.conf`) обновляется супервизором
+  ежедневно; прокси перезапускается только если данные изменились
+- Обновление релея: `git pull && docker compose -f docker-compose.prod.yml up -d --build relay`
+  (сессии инвалидируются, клиенты переподключаются автоматически); откат —
+  `git checkout v1.0.0` и та же команда
+
 ### 3. Контейнеры
 
 ```bash

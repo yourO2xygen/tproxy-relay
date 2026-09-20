@@ -16,8 +16,10 @@ builder.Logging.AddSimpleConsole(o =>
 builder.Logging.AddFilter("Microsoft.AspNetCore", LogLevel.Warning);
 builder.WebHost.ConfigureKestrel(k =>
 {
-    k.ListenAnyIP(opt.ListenPort);
-    k.ListenAnyIP(opt.AdminPort);
+    if (opt.ListenAddress is { } la) k.Listen(la, opt.ListenPort);
+    else k.ListenAnyIP(opt.ListenPort);
+    if (opt.AdminAddress is { } aa) k.Listen(aa, opt.AdminPort);
+    else k.ListenAnyIP(opt.AdminPort);
     k.Limits.MaxRequestBodySize = 4 * 1024 * 1024;
     k.Limits.MaxRequestLineSize = 16 * 1024;
     k.Limits.MaxConcurrentConnections = 256;
@@ -28,7 +30,24 @@ builder.Services.Configure<HostOptions>(o => o.ShutdownTimeout = TimeSpan.FromSe
 var app = builder.Build();
 
 var minter = new TokenMinter(TokenMinter.LoadOrCreateKey(opt.TokenKeyPath));
-var hub = new RelayHub(opt, minter, app.Logger);
+// Managed keys: SQLite registry + seed import + the registry file the
+// MTProxy container supervisor reconciles against. The environment secret
+// remains the built-in profile on the default backend port.
+var store = new KeyStore(opt.KeysDbPath);
+var seeded = store.ImportSeed(Path.Combine(store.DataDirectory, "seed.json"));
+if (seeded.Count > 0)
+    app.Logger.LogInformation("event=keys_seeded count={Count}", seeded.Count);
+store.ExportRegistry(Convert.ToHexString(opt.Secret).ToLowerInvariant());
+var builtinProfile = new RelayProfile("builtin", "builtin", opt.Secret,
+    opt.BackendHostName, opt.BackendPort, opt.CarrierMode);
+var registry = new ProfileRegistry(opt, builtinProfile);
+registry.ReplaceManaged(store.ListKeys(includeRevoked: false).Where(k => k.Active).Select(k =>
+    new RelayProfile(k.Id, k.Name, Convert.FromHexString(k.SecretHex),
+        opt.BackendHostName, k.BackendPort, opt.CarrierMode)));
+var hub = new RelayHub(opt, minter, app.Logger, store);
+var publicContent = PublicContent.Create(opt, app.Logger);
+AdminApi.Map(app, opt, hub, store, registry);
+TelegramBot.ValidateAndRegister(app, opt, hub, store, registry);
 _ = hub.StartReaper(app.Lifetime.ApplicationStopping);
 // Graceful shutdown: close all sessions so carriers observe a clean end
 // (Close frames / cancelled polls) instead of TCP resets; long polls (25s)
@@ -41,10 +60,17 @@ app.Logger.LogInformation(
 
 app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromSeconds(20) });
 
+// Base-path routing (BASE_PATH.md): at the root the web path is "/", with a
+// prefix every transport endpoint moves under "/<base>/". Only the
+// trailing-slash form is served; "/<base>" without the slash is not
+// special-cased and gets the ordinary public 404.
+var webRoot = BasePaths.WebPath(opt.BasePath);
+
 // Admin listener lives on its own loopback port and never sees public traffic.
+// /admin/* (when enabled) falls through to the AdminApi endpoints below.
 app.Use(async (ctx, next) =>
 {
-    if (ctx.Connection.LocalPort == opt.AdminPort)
+    if (ctx.Connection.LocalPort == opt.AdminPort && !ctx.Request.Path.StartsWithSegments("/admin"))
     {
         switch (ctx.Request.Path.Value)
         {
@@ -66,12 +92,52 @@ app.Use(async (ctx, next) =>
                 return;
         }
     }
+    // Carrier surface hygiene (PROTOCOL.md): HTTP API requests carry no
+    // cookies, and capacity accounting needs exactly one client address.
+    if (ctx.Request.Path.StartsWithSegments(webRoot + "api/v1"))
+    {
+        if (ctx.Request.Headers.ContainsKey("Cookie"))
+        {
+            ctx.Response.StatusCode = 400;
+            return;
+        }
+    }
+    var ip = ClientIp(ctx);
+    if (ip is null)
+    {
+        // X-Forwarded-For carried a list or an unparsable value.
+        ctx.Response.StatusCode = 400;
+        return;
+    }
+    ctx.Items["ClientIp"] = ip;
     await next();
 });
+
+/// <summary>
+/// Exactly one accounting address: a single X-Forwarded-For value when present
+/// (a list is rejected — the front proxy must not append), else the socket peer.
+/// </summary>
+static IPAddress? ClientIp(HttpContext ctx)
+{
+    var xff = ctx.Request.Headers["X-Forwarded-For"].ToString();
+    if (xff.Length == 0)
+        return ctx.Connection.RemoteIpAddress;
+    return IPAddress.TryParse(xff.Trim(), out var ip) ? ip : null;
+}
 
 bool HostOk(HttpContext ctx) =>
     !opt.RequireHost ||
     string.Equals(ctx.Request.Host.Host, opt.PublicHostname, StringComparison.OrdinalIgnoreCase);
+
+bool ExactBridgeQuery(HttpContext ctx, out string value)
+{
+    value = "";
+    var q = ctx.Request.Query;
+    if (!(q.Count == 1 && q.ContainsKey("bridge") && q["bridge"].Count == 1))
+        return false;
+    value = q["bridge"].ToString();
+    return value.Length == 43;
+}
 
 static string? Bearer(HttpContext ctx)
 {
@@ -89,44 +155,56 @@ static string? Bearer(HttpContext ctx)
 
 // -- public root: bridge selection or ordinary site -------------------------
 
-app.MapGet("/", async (HttpContext ctx) =>
+app.MapGet(webRoot, async (HttpContext ctx) =>
 {
     if (!HostOk(ctx))
     {
-        await PublicSite.NotFound(ctx);
+        await publicContent.NotFoundAsync(ctx);
         return;
     }
-    var q = ctx.Request.Query;
-    var exact = q.Count == 1 && q.ContainsKey("bridge") && q["bridge"].Count == 1;
-    var value = exact ? q["bridge"].ToString() : "";
-    if (exact && value.Length == 43 && CapabilityDeriver.Matches(value, opt.CapabilityBytes))
+    if (ExactBridgeQuery(ctx, out var value))
     {
-        var bootstrap = hub.MintBootstrap();
-        if (bootstrap == null)
+        var profile = registry.Match(value);
+        if (profile != null)
         {
-            ctx.Response.StatusCode = 503; // outstanding bootstrap cap
-            ctx.Response.Headers["Retry-After"] = "2";
+            var bootstrap = hub.MintBootstrap(ctx.Items["ClientIp"] as IPAddress, profile);
+            if (bootstrap == null)
+            {
+                ctx.Response.StatusCode = 503; // bootstrap cap or creation-rate bucket
+                ctx.Response.Headers["Retry-After"] = "2";
+                return;
+            }
+            await BridgePage.Write(ctx, bootstrap, profile.CarrierMode, opt.PublicHostname, opt.BasePath);
             return;
         }
-        await BridgePage.Write(ctx, bootstrap, opt.CarrierMode, opt.PublicHostname);
+    }
+    if (opt.BasePath.Length > 0)
+    {
+        // With a base path the root is not a transport path. An authentic
+        // capability offered here fails locally with an uncacheable 404;
+        // everything else is the public home page.
+        if (ExactBridgeQuery(ctx, out var v2) && registry.Match(v2) != null)
+            await publicContent.NotFoundAsync(ctx);
+        else
+            await publicContent.HomeAsync(ctx);
         return;
     }
-    await PublicSite.Index(ctx); // missing/wrong/augmented bridge query: same home page
+    await publicContent.HomeAsync(ctx); // missing/wrong/augmented bridge query: same home page
 });
 
 // -- carrier API -------------------------------------------------------------
 
-app.MapPost("/api/v1/session", async (HttpContext ctx) =>
+app.MapPost(webRoot + "api/v1/session", async (HttpContext ctx) =>
 {
     if (!HostOk(ctx))
     {
-        await PublicSite.NotFound(ctx);
+        await publicContent.FallbackAsync(ctx);
         return;
     }
     var token = Bearer(ctx);
     if (token == null || !minter.TryValidate(token, TokenMinter.KindBootstrap))
     {
-        await PublicSite.NotFound(ctx); // random credentials follow the public site
+        await publicContent.FallbackAsync(ctx); // random credentials follow the public site
         return;
     }
     if (ctx.Request.ContentLength is > 64)
@@ -148,7 +226,7 @@ app.MapPost("/api/v1/session", async (HttpContext ctx) =>
         ctx.Response.StatusCode = 400;
         return;
     }
-    switch (hub.TryRedeemBootstrap(token, body, out var session))
+    switch (hub.TryRedeemBootstrap(token, body, ctx.Items["ClientIp"] as IPAddress, out var session))
     {
         case RedeemResult.Ok when session != null:
             ctx.Response.StatusCode = 200;
@@ -170,17 +248,17 @@ app.MapPost("/api/v1/session", async (HttpContext ctx) =>
     }
 });
 
-app.MapPost("/api/v1/up", async (HttpContext ctx) =>
+app.MapPost(webRoot + "api/v1/up", async (HttpContext ctx) =>
 {
     if (!HostOk(ctx))
     {
-        await PublicSite.NotFound(ctx);
+        await publicContent.FallbackAsync(ctx);
         return;
     }
     var session = hub.AuthSession(Bearer(ctx));
     if (session == null)
     {
-        await PublicSite.NotFound(ctx);
+        await publicContent.FallbackAsync(ctx);
         return;
     }
     if (!ctx.Request.Headers.TryGetValue("X-Up-Seq", out var seqStr) ||
@@ -197,6 +275,31 @@ app.MapPost("/api/v1/up", async (HttpContext ctx) =>
     using var ms = new MemoryStream();
     await ctx.Request.Body.CopyToAsync(ms);
     var body = ms.ToArray();
+    var laneId = ParseLaneId(ctx, session.LanesMode);
+    if (laneId < 0)
+    {
+        ctx.Response.StatusCode = 400; // lanes mode requires a valid X-Lane-ID
+        return;
+    }
+    if (session.LanesMode)
+    {
+        var laneResult = await hub.ApplyUpLane(session, (uint)laneId, seq, body);
+        switch (laneResult.Outcome)
+        {
+            case LaneOutcome.Ok or LaneOutcome.LaneClosed:
+                ctx.Response.StatusCode = 204;
+                ctx.Response.Headers["X-Up-Ack"] = laneResult.AckSeq.ToString();
+                return;
+            case LaneOutcome.RetryLater:
+                ctx.Response.StatusCode = 503;
+                ctx.Response.Headers["Retry-After"] = "1";
+                return;
+            default:
+                hub.CloseSession(session, $"uplink error: {laneResult.Error}");
+                ctx.Response.StatusCode = 409;
+                return;
+        }
+    }
     var result = await hub.ApplyUp(session, seq, body);
     switch (result.Outcome)
     {
@@ -215,17 +318,17 @@ app.MapPost("/api/v1/up", async (HttpContext ctx) =>
     }
 });
 
-app.MapPost("/api/v1/down", async (HttpContext ctx) =>
+app.MapPost(webRoot + "api/v1/down", async (HttpContext ctx) =>
 {
     if (!HostOk(ctx))
     {
-        await PublicSite.NotFound(ctx);
+        await publicContent.FallbackAsync(ctx);
         return;
     }
     var session = hub.AuthSession(Bearer(ctx));
     if (session == null)
     {
-        await PublicSite.NotFound(ctx);
+        await publicContent.FallbackAsync(ctx);
         return;
     }
     if (!ctx.Request.Headers.TryGetValue("X-Down-Cursor", out var curStr) ||
@@ -234,7 +337,15 @@ app.MapPost("/api/v1/down", async (HttpContext ctx) =>
         ctx.Response.StatusCode = 400;
         return;
     }
-    var result = await hub.GetDown(session, cursor, ctx.RequestAborted);
+    var laneId = ParseLaneId(ctx, session.LanesMode);
+    if (laneId < 0)
+    {
+        ctx.Response.StatusCode = 400;
+        return;
+    }
+    var result = session.LanesMode
+        ? await hub.GetDownLane(session, (uint)laneId, cursor, ctx.RequestAborted)
+        : await hub.GetDown(session, cursor, ctx.RequestAborted);
     if (result.ProtocolError)
     {
         hub.CloseSession(session, "downlink protocol error");
@@ -245,6 +356,8 @@ app.MapPost("/api/v1/down", async (HttpContext ctx) =>
     {
         ctx.Response.StatusCode = 204;
         ctx.Response.Headers["X-Down-Cursor"] = cursor.ToString();
+        if (result.LaneClosed)
+            ctx.Response.Headers["X-Lane-Closed"] = "1";
         return;
     }
     ctx.Response.StatusCode = 200;
@@ -254,51 +367,89 @@ app.MapPost("/api/v1/down", async (HttpContext ctx) =>
     await ctx.Response.Body.WriteAsync(result.Body);
 });
 
-app.MapDelete("/api/v1/session", async (HttpContext ctx) =>
+app.MapDelete(webRoot + "api/v1/session", async (HttpContext ctx) =>
 {
     if (!HostOk(ctx))
     {
-        await PublicSite.NotFound(ctx);
+        await publicContent.FallbackAsync(ctx);
         return;
     }
     var session = hub.AuthSession(Bearer(ctx));
     if (session == null)
     {
-        await PublicSite.NotFound(ctx);
+        await publicContent.FallbackAsync(ctx);
         return;
     }
     hub.CloseSession(session, "client close");
     ctx.Response.StatusCode = 204;
 });
 
-app.MapGet("/api/v1/ws", async (HttpContext ctx) =>
+app.MapGet(webRoot + "api/v1/ws", async (HttpContext ctx) =>
 {
     if (!ctx.WebSockets.IsWebSocketRequest || !HostOk(ctx))
     {
-        await PublicSite.NotFound(ctx);
+        await publicContent.FallbackAsync(ctx);
         return;
     }
     const string prefix = "tproxy-v1.";
+    const string lanePrefix = "tproxy-lane-v1.";
     var proto = ctx.Request.Headers.SecWebSocketProtocol.ToString();
+    if (proto.StartsWith(lanePrefix, StringComparison.Ordinal))
+    {
+        // websocket-lanes: one socket per stream, tproxy-lane-v1.<token>.<sid>
+        var rest = proto[lanePrefix.Length..];
+        var dot = rest.IndexOf('.');
+        if (dot != 43 || !uint.TryParse(rest[(dot + 1)..], out var sid) || sid == 0)
+        {
+            await publicContent.FallbackAsync(ctx);
+            return;
+        }
+        var session = hub.AuthSession(rest[..dot]);
+        if (session == null || session.CarrierMode != "websocket-lanes" ||
+            session.IsTombstoned(sid) || session.Lanes.TryGetValue(sid, out var l) && l.AttachedSocket != null)
+        {
+            await publicContent.FallbackAsync(ctx);
+            return;
+        }
+        var laneWs = await ctx.WebSockets.AcceptWebSocketAsync(proto);
+        await hub.RunWebSocketLane(session, sid, laneWs, ctx.RequestAborted);
+        return;
+    }
     if (!proto.StartsWith(prefix, StringComparison.Ordinal))
     {
-        await PublicSite.NotFound(ctx);
+        await publicContent.FallbackAsync(ctx);
         return;
     }
     var token = proto[prefix.Length..];
-    var session = hub.AuthSession(token);
-    if (session == null)
+    var session2 = hub.AuthSession(token);
+    if (session2 == null)
     {
-        await PublicSite.NotFound(ctx);
+        await publicContent.FallbackAsync(ctx);
         return;
     }
     var ws = await ctx.WebSockets.AcceptWebSocketAsync(proto);
-    await hub.RunWebSocket(session, ws, ctx.RequestAborted);
+    await hub.RunWebSocket(session2, ws, ctx.RequestAborted);
 });
 
-app.MapFallback(async (HttpContext ctx) => await PublicSite.NotFound(ctx));
+// An explicit {*path} template (not the :nonfile default) so paths with a
+// dot — /about.html, /logo.png — also reach the public handler.
+app.MapFallback("/{*path}", async (HttpContext ctx) => await publicContent.FallbackAsync(ctx));
 
 app.Run();
+
+/// <summary>
+/// X-Lane-ID parsing: returns the lane id, or -1 when the header value is
+/// invalid. In lanes mode the header is mandatory; elsewhere it must be absent.
+/// </summary>
+static int ParseLaneId(HttpContext ctx, bool lanesMode)
+{
+    var present = ctx.Request.Headers.TryGetValue("X-Lane-ID", out var v);
+    if (!lanesMode)
+        return present ? -1 : 0;
+    if (!present || !uint.TryParse(v, out var lane) || lane > FrameCodec.MaxStreamId)
+        return -1;
+    return (int)lane;
+}
 
 static async Task<bool> BackendReachable(RelayOptions opt)
 {

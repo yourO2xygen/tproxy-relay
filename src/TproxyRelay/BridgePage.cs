@@ -14,6 +14,8 @@ public static class BridgePage
 (function(){
 'use strict';
 var MODE='{{MODE}}';
+var BASE='{{BASE}}';
+var LANES=(MODE==='https-lanes'||MODE==='websocket-lanes');
 var UP_LIMIT=2*1024*1024;
 var PENDING_LIMIT=32*1024*1024;
 var pending=[];
@@ -31,7 +33,7 @@ var batchMode=false;   // loopback MessagePort boundary expects complete carrier
 var nonce=null;
 var m=location.hash.match(/^#android=([A-Za-z0-9_-]+)/);
 if(m)nonce=m[1];
-history.replaceState(null,'','/');
+history.replaceState(null,'',location.pathname);
 
 function sleep(ms){return new Promise(function(r){setTimeout(r,ms);});}
 
@@ -77,16 +79,95 @@ function sendStatus(st){sendControl({t:'status',state:st});}
 function sendCloseMsg(){sendControl({t:'close'});}
 function wake(){if(queueWaiter){var w=queueWaiter;queueWaiter=null;w();}}
 
+// ---- frame plumbing -------------------------------------------------------
+
+function frameLen(u,off){return ((u[off+4]<<24)|(u[off+5]<<16)|(u[off+6]<<8)|u[off+7])>>>0;}
+function frameSid(u,off){return ((u[off+1]<<16)|(u[off+2]<<8)|u[off+3])>>>0;}
+function frameType(u,off){return u[off];}
+
+function splitFrames(buf){
+  var u=new Uint8Array(buf),out=[],off=0;
+  while(off<u.length){
+    var end=off+8+frameLen(u,off);
+    out.push(u.slice(off,end));
+    off=end;
+  }
+  return out;
+}
+
+// ---- lanes state (https-lanes / websocket-lanes) --------------------------
+
+var lanes={};
+function lane(sid){
+  var L=lanes[sid];
+  if(!L)L=lanes[sid]={q:[],bytes:0,waiter:null,seq:1,cursor:0,closed:false,sawClose:false,started:false,sentOpen:false};
+  return L;
+}
+function pushLane(sid,buf){
+  var L=lane(sid);
+  if(L.bytes+buf.byteLength>PENDING_LIMIT)return;
+  L.q.push(buf);L.bytes+=buf.byteLength;
+  if(L.waiter){var w=L.waiter;L.waiter=null;w();}
+}
+function takeLaneBatch(sid){
+  var L=lane(sid);
+  return new Promise(function(resolve){
+    function emit(){
+      var items=[],bytes=0;
+      while(L.q.length&&bytes<UP_LIMIT){var b=L.q.shift();items.push(b);bytes+=b.byteLength;}
+      L.bytes-=bytes;
+      var out=new Uint8Array(bytes),off=0;
+      for(var i=0;i<items.length;i++){out.set(new Uint8Array(items[i]),off);off+=items[i].byteLength;}
+      resolve(out);
+    }
+    if(L.q.length)emit();else L.waiter=emit;
+  });
+}
+// Requeue a buffer at the head of a lane (OPEN-first splitting).
+function unshiftLane(sid,u8){
+  var L=lane(sid);
+  L.q.unshift(u8.buffer.slice(u8.byteOffset,u8.byteOffset+u8.length));
+  L.bytes+=u8.byteLength;
+}
+function deliverDown(body){
+  if(batchMode){scanClose(body);sendBytes(body);return;}
+  var fs=splitFrames(body);
+  for(var i=0;i<fs.length;i++){
+    if(frameType(fs[i],0)===3)lane(frameSid(fs[i],0)).sawClose=true;
+    sendBytes(fs[i]);
+  }
+}
+function scanClose(body){
+  var u=new Uint8Array(body),off=0;
+  while(off<u.length){
+    if(frameType(u,off)===3)lane(frameSid(u,off)).sawClose=true;
+    off+=8+frameLen(u,off);
+  }
+}
+
 function onClientValue(v){
   if(v&&typeof v==='object'&&!(v instanceof ArrayBuffer)&&v.t==='close'){
     
     stopped=true;
     if(sessionToken){
-      try{fetch('/api/v1/session',{method:'DELETE',mode:'same-origin',credentials:'omit',cache:'no-store',redirect:'error',headers:{'Authorization':'Bearer '+sessionToken},keepalive:true});}catch(e){}
+      try{fetch(BASE+'api/v1/session',{method:'DELETE',mode:'same-origin',credentials:'omit',cache:'no-store',redirect:'error',headers:{'Authorization':'Bearer '+sessionToken},keepalive:true});}catch(e){}
     }
     return;
   }
   if(!(v instanceof ArrayBuffer))return;   // control values are not carrier data
+  if(LANES){
+    // Route each complete frame to the lane of its stream id; only the shared
+    // header and frame boundary are inspected, never the payload.
+    if(!started){
+      started=true;
+      firstBuffer=v;
+      if(firstReady){var r=firstReady;firstReady=null;r(v);}
+      return;
+    }
+    var fs=splitFrames(v);
+    for(var i=0;i<fs.length;i++)pushLane(frameSid(fs[i],0),fs[i]);
+    return;
+  }
   if(started){
     if(pendingBytes+v.byteLength>PENDING_LIMIT)return;
     pending.push(v);pendingBytes+=v.byteLength;wake();
@@ -94,7 +175,7 @@ function onClientValue(v){
   }
   firstBuffer=v;started=true;
   
-  if(firstReady){var r=firstReady;firstReady=null;r(v);}
+  if(firstReady){var r2=firstReady;firstReady=null;r2(v);}
 }
 
 function takeFirst(){
@@ -116,17 +197,6 @@ function takeBatch(){
   });
 }
 
-function splitFrames(buf){
-  var u=new Uint8Array(buf),out=[],off=0;
-  while(off<u.length){
-    var len=((u[off+4]<<24)|(u[off+5]<<16)|(u[off+6]<<8)|u[off+7])>>>0;
-    var end=off+8+len;
-    out.push(u.slice(off,end));
-    off=end;
-  }
-  return out;
-}
-
 function post(url,headers,body){
   return fetch(url,{method:'POST',mode:'same-origin',credentials:'omit',cache:'no-store',redirect:'error',referrerPolicy:'no-referrer',headers:headers,body:body});
 }
@@ -134,8 +204,18 @@ function post(url,headers,body){
 // ---- carrier -------------------------------------------------------------
 
 async function createSession(){
-  var hello=await takeFirst();
-  var r=await post('/api/v1/session',
+  var hello;
+  if(LANES){
+    // The create body is a single HELLO frame; later frames of the first
+    // message are re-routed to their lanes.
+    var buf=await takeFirst();
+    var fs=splitFrames(buf);
+    hello=fs[0];
+    for(var i=1;i<fs.length;i++)pushLane(frameSid(fs[i],0),fs[i]);
+  }else{
+    hello=await takeFirst();
+  }
+  var r=await post(BASE+'api/v1/session',
     {'Authorization':'Bearer '+'{{BOOTSTRAP}}','Content-Type':'application/octet-stream'},hello);
   if(!r.ok)throw new Error('session create failed: '+r.status);
   sessionToken=r.headers.get('X-Session-Token');
@@ -155,7 +235,7 @@ async function upLoop(tok){
       if(stopped)return;
       var r;
       try{
-        r=await post('/api/v1/up',
+        r=await post(BASE+'api/v1/up',
           {'Authorization':'Bearer '+tok,'Content-Type':'application/octet-stream','X-Up-Seq':String(seq)},body);
       }catch(e){await sleep(500);continue;}
       if(r.status===204){seq++;break;}
@@ -171,7 +251,7 @@ async function downLoop(tok,cursor0){
     if(stopped)return;
     var r;
     try{
-      r=await post('/api/v1/down',
+      r=await post(BASE+'api/v1/down',
         {'Authorization':'Bearer '+tok,'X-Down-Cursor':String(cursor)},new Uint8Array(0));
     }catch(e){await sleep(500);continue;}
     if(r.status===204)continue;
@@ -190,8 +270,82 @@ async function downLoop(tok,cursor0){
   }
 }
 
+// ---- https-lanes ----------------------------------------------------------
+
+function laneUpLoop(tok,sid){
+  var L=lane(sid);
+  return (async function(){
+    for(;;){
+      if(stopped||L.closed)return;
+      var body=await takeLaneBatch(sid);
+      for(;;){
+        if(stopped||L.closed)return;
+        var r;
+        try{
+          r=await post(BASE+'api/v1/up',
+            {'Authorization':'Bearer '+tok,'Content-Type':'application/octet-stream',
+             'X-Up-Seq':String(L.seq),'X-Lane-ID':String(sid)},body);
+        }catch(e){await sleep(500);continue;}
+        if(r.status===204){L.seq++;break;}
+        if(r.status===503){await sleep(parseInt(r.headers.get('Retry-After')||'1',10)*1000);continue;}
+        throw new Error('lane uplink failed: '+r.status);
+      }
+    }
+  })();
+}
+
+function laneDownLoop(tok,sid){
+  var L=lane(sid);
+  return (async function(){
+    for(;;){
+      if(stopped)return;
+      if(sid>0&&L.closed)return;
+      var r;
+      try{
+        r=await post(BASE+'api/v1/down',
+          {'Authorization':'Bearer '+tok,'X-Down-Cursor':String(L.cursor),'X-Lane-ID':String(sid)},
+          new Uint8Array(0));
+      }catch(e){await sleep(500);continue;}
+      if(r.status===204){
+        if(r.headers.get('X-Lane-Closed')==='1'){L.closed=true;return;}
+        continue;
+      }
+      if(r.status===200){
+        var body=new Uint8Array(await r.arrayBuffer());
+        L.cursor=parseInt(r.headers.get('X-Down-Cursor')||String(L.cursor),10);
+        deliverDown(body);
+        continue;
+      }
+      throw new Error('lane downlink failed: '+r.status);
+    }
+  })();
+}
+
+function startLaneLoops(tok,sid){
+  var L=lane(sid);
+  if(L.started)return;
+  L.started=true;
+  laneTasks.push(laneUpLoop(tok,sid));
+  laneTasks.push(laneDownLoop(tok,sid));
+}
+var laneTasks=[];
+
+async function httpsLanesLoop(tok){
+  // lane 0 (session-level PONG traffic) runs immediately
+  startLaneLoops(tok,0);
+  for(;;){
+    if(stopped)return;
+    await new Promise(function(r){setTimeout(r,50);});
+    for(var sid in lanes){
+      if(sid!=='0'&&+sid>0&&!lanes[sid].started)startLaneLoops(tok,+sid);
+    }
+  }
+}
+
+// ---- websocket / websocket-lanes ------------------------------------------
+
 async function wsLoop(tok){
-  var ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/api/v1/ws','tproxy-v1.'+tok);
+  var ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+BASE+'api/v1/ws','tproxy-v1.'+tok);
   ws.binaryType='arraybuffer';
   ws.onmessage=function(ev){
     if(typeof ev.data==='string')return;
@@ -212,6 +366,67 @@ async function wsLoop(tok){
   }
 }
 
+function wsLane(tok,sid){
+  var L=lane(sid);
+  return (async function(){
+    var ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+BASE+'api/v1/ws',
+      'tproxy-lane-v1.'+tok+'.'+String(sid));
+    L.ws=ws;
+    ws.binaryType='arraybuffer';
+    ws.onmessage=function(ev){
+      if(typeof ev.data==='string')return;
+      deliverDown(new Uint8Array(ev.data));
+    };
+    ws.onclose=function(){
+      L.closed=true;
+      if(!L.sawClose){
+        // Unexpected lane loss: the bridge reports the stream as closed.
+        var c=new Uint8Array(8);
+        c[0]=3;c[1]=(sid>>16)&255;c[2]=(sid>>8)&255;c[3]=sid&255;
+        sendBytes(c);
+      }
+    };
+    await new Promise(function(res,rej){ws.onopen=res;ws.onerror=rej;});
+    for(;;){
+      if(stopped||ws.readyState!==1||L.closed)return;
+      var body=await takeLaneBatch(sid);
+      if(!L.sentOpen){
+        // The first WebSocket message on a lane is exactly one OPEN frame.
+        var fs=splitFrames(body);
+        if(fs.length>1){
+          var restLen=body.byteLength-fs[0].byteLength;
+          var rest=new Uint8Array(restLen),off=0;
+          for(var i=1;i<fs.length;i++){rest.set(fs[i],off);off+=fs[i].byteLength;}
+          unshiftLane(sid,rest);
+          body=fs[0];
+        }
+        L.sentOpen=true;
+        ws.send(body);
+        continue;
+      }
+      if(ws.readyState!==1)return;
+      ws.send(body);
+    }
+  })();
+}
+
+async function wsLanesLoop(tok){
+  lane(0); // session-level state exists, but lane zero has no WebSocket
+  for(;;){
+    if(stopped)return;
+    var started_any=false;
+    for(var sid in lanes){
+      var L=lanes[sid];
+      if(+sid>0&&!L.started&&!L.closed){
+        L.started=true;
+        laneTasks.push(wsLane(tok,+sid));
+        started_any=true;
+      }
+    }
+    await new Promise(function(r){setTimeout(r,started_any?100:50);});
+  }
+}
+
 async function start(){
   try{
     
@@ -221,8 +436,12 @@ async function start(){
     var s=await createSession();
     
     sendStatus('connected');
-    if(s.mode==='websocket'||s.mode==='websocket-lanes'){
+    if(s.mode==='websocket'){
       await wsLoop(s.token);
+    }else if(s.mode==='websocket-lanes'){
+      await Promise.race([wsLanesLoop(s.token)].concat(laneTasks));
+    }else if(s.mode==='https-lanes'){
+      await Promise.race([httpsLanesLoop(s.token)].concat(laneTasks));
     }else{
       var tasks=[upLoop(s.token),downLoop(s.token,s.cursor)];
       await Promise.race(tasks);
@@ -241,13 +460,14 @@ start();
 </html>
 """;
 
-    public static async Task Write(HttpContext ctx, string bootstrap, string mode, string hostname)
+    public static async Task Write(HttpContext ctx, string bootstrap, string mode, string hostname, string basePath = "")
     {
         var nonce = Base64Url.EncodeToString(RandomNumberGenerator.GetBytes(16));
         var html = Template
             .Replace("{{NONCE}}", nonce)
             .Replace("{{BOOTSTRAP}}", bootstrap)
-            .Replace("{{MODE}}", mode);
+            .Replace("{{MODE}}", mode)
+            .Replace("{{BASE}}", BasePaths.WebPath(basePath));
 
         ctx.Response.StatusCode = 200;
         ctx.Response.ContentType = "text/html; charset=utf-8";

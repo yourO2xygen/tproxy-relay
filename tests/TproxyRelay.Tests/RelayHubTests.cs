@@ -95,7 +95,7 @@ public class RelayHubTests : IAsyncLifetime
     {
         var bootstrap = _hub.MintBootstrap();
         Assert.NotNull(bootstrap);
-        var result = _hub.TryRedeemBootstrap(bootstrap!, Hello(), out var session);
+        var result = _hub.TryRedeemBootstrap(bootstrap!, Hello(), null, out var session);
         Assert.Equal(RedeemResult.Ok, result);
         Assert.NotNull(session);
         return session!;
@@ -113,8 +113,8 @@ public class RelayHubTests : IAsyncLifetime
     public void Bootstrap_Redemption_IsIdempotent_SameBody_SameSession()
     {
         var bootstrap = _hub.MintBootstrap()!;
-        var r1 = _hub.TryRedeemBootstrap(bootstrap, Hello(), out var s1);
-        var r2 = _hub.TryRedeemBootstrap(bootstrap, Hello(), out var s2);
+        var r1 = _hub.TryRedeemBootstrap(bootstrap, Hello(), null, out var s1);
+        var r2 = _hub.TryRedeemBootstrap(bootstrap, Hello(), null, out var s2);
         Assert.Equal(RedeemResult.Ok, r1);
         Assert.Equal(RedeemResult.Ok, r2);
         Assert.Equal(s1!.Token, s2!.Token);
@@ -124,9 +124,9 @@ public class RelayHubTests : IAsyncLifetime
     public void Bootstrap_Replay_WithDifferentBody_IsInvalid()
     {
         var bootstrap = _hub.MintBootstrap()!;
-        Assert.Equal(RedeemResult.Ok, _hub.TryRedeemBootstrap(bootstrap, Hello(), out _));
+        Assert.Equal(RedeemResult.Ok, _hub.TryRedeemBootstrap(bootstrap, Hello(), null, out _));
         var other = FrameCodec.Encode(FrameType.Hello, 0, [2]);
-        Assert.Equal(RedeemResult.Invalid, _hub.TryRedeemBootstrap(bootstrap, other, out _));
+        Assert.Equal(RedeemResult.Invalid, _hub.TryRedeemBootstrap(bootstrap, other, null, out _));
     }
 
     [Fact]
@@ -198,7 +198,7 @@ public class RelayHubTests : IAsyncLifetime
         };
         var hub = new RelayHub(tight, new TokenMinter(new byte[32]), NullLogger.Instance);
         var bootstrap = hub.MintBootstrap()!;
-        var session = hub.TryRedeemBootstrap(bootstrap, Hello(), out var s) == RedeemResult.Ok
+        var session = hub.TryRedeemBootstrap(bootstrap, Hello(), null, out var s) == RedeemResult.Ok
             ? s! : throw new InvalidOperationException();
 
         var open = FrameCodec.Encode(FrameType.Open, 5);
@@ -224,7 +224,7 @@ public class RelayHubTests : IAsyncLifetime
         };
         var hub = new RelayHub(capped, new TokenMinter(new byte[32]), NullLogger.Instance);
         var bootstrap = hub.MintBootstrap()!;
-        Assert.Equal(RedeemResult.Ok, hub.TryRedeemBootstrap(bootstrap, Hello(), out var session));
+        Assert.Equal(RedeemResult.Ok, hub.TryRedeemBootstrap(bootstrap, Hello(), null, out var session));
 
         var up1 = await hub.ApplyUp(session!, 1, FrameCodec.Encode(FrameType.Open, 1));
         Assert.Equal(UpOutcome.Acked, up1.Outcome);
@@ -243,7 +243,7 @@ public class RelayHubTests : IAsyncLifetime
     [Fact]
     public void Tombstones_EvictOldest_ButKeepRecent()
     {
-        var session = new Session { Token = "test" };
+        var session = new Session { Token = "test", CarrierMode = "https" };
         for (uint i = 1; i <= 5000; i++)
             session.AddTombstone(i);
         Assert.False(session.IsTombstoned(1));   // evicted

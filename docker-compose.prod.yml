@@ -20,7 +20,16 @@ services:
       TPROXY_SECRET_HEX_FILE: ${TPROXY_SECRET_HEX_FILE:-}
       TPROXY_BACKEND_HOST: mtproxy:2398
       TPROXY_CARRIER_MODE: ${TPROXY_CARRIER_MODE:-https}
+      # Пусто = прокси в корне хоста; со слагом все пути переезжают под /<base>/
+      # иcapability выводится из host+path (ссылка использует маркированный секрет).
+      TPROXY_BASE_PATH: ${TPROXY_BASE_PATH:-}
       TPROXY_TOKEN_KEY_PATH: /data/token.key
+      TPROXY_KEYS_DB: /data/keys.db
+      TPROXY_API_ENABLED: ${TPROXY_API_ENABLED:-false}
+      TPROXY_API_TOKEN: ${TPROXY_API_TOKEN:-}
+      TPROXY_BOT_ENABLED: ${TPROXY_BOT_ENABLED:-false}
+      TPROXY_BOT_TOKEN: ${TPROXY_BOT_TOKEN:-}
+      TPROXY_BOT_ADMINS: ${TPROXY_BOT_ADMINS:-}
     volumes:
       - relay-data:/data
     networks:
@@ -49,9 +58,12 @@ services:
     container_name: tproxy-mtproxy
     environment:
       MTPROXY_SECRET: ${TPROXY_SECRET_HEX:?err}
+      KEYS_FILE: /keys/registry.txt
       # За docker-NAT middle-end должен представляться публичным адресом.
       # IP фиксирован в сети ниже (172.20.0.2), меняется только публичная часть.
       MTPROXY_NAT_ARGS: --nat-info ${MTPROXY_LOCAL_IP:-172.20.0.2}:${MTPROXY_PUBLIC_IP:?err}
+    volumes:
+      - relay-data:/keys:ro   # registry.txt written by the relay supervisor-side
     networks:
       tproxy-net:
         ipv4_address: 172.20.0.2

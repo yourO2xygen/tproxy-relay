@@ -6,14 +6,20 @@ namespace TproxyRelay;
 
 /// <summary>
 /// Derivation of the bridge capability:
-/// context = UTF-8("tdesktop-web-proxy-bridge-v1\n" + hostname)
+/// context = UTF-8("tdesktop-web-proxy-bridge-v1\n" + hostname)                 (root)
+///         = UTF-8("tdesktop-web-proxy-bridge-v2\n" + hostname + "\n" + path)   (base path)
 /// capability = base64url-no-padding(HMAC-SHA256(key=secret, message=context))
 /// </summary>
 public static class CapabilityDeriver
 {
-    public static string Derive(string hostname, byte[] secret)
+    public static string Derive(string hostname, byte[] secret) =>
+        Derive(hostname, secret, "");
+
+    public static string Derive(string hostname, byte[] secret, string basePath)
     {
-        var context = Encoding.UTF8.GetBytes("tdesktop-web-proxy-bridge-v1\n" + hostname);
+        var context = basePath.Length == 0
+            ? Encoding.UTF8.GetBytes("tdesktop-web-proxy-bridge-v1\n" + hostname)
+            : Encoding.UTF8.GetBytes("tdesktop-web-proxy-bridge-v2\n" + hostname + "\n" + basePath);
         var mac = HMACSHA256.HashData(secret, context);
         return Base64Url.EncodeToString(mac);
     }

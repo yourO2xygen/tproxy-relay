@@ -1,0 +1,32 @@
+{
+  "public_hostname": "proxy.example.com",
+  "listen": "0.0.0.0:8080",
+  "admin_listen": "0.0.0.0:8081",
+  "carrier_mode": "https",
+  "token_key_file": "/data/token.key",
+  "limits": {
+    "max_sessions_global": 128,
+    "max_streams_global": 4096,
+    "max_streams_per_session": 128,
+    "max_backend_dials_in_flight": 256,
+    "max_bootstraps_global": 512,
+    "max_pending_global_bytes": 536870912,
+    "max_pending_global_items": 262144,
+    "max_pending_per_session": 33554432,
+    "max_frame_payload": 1048576,
+    "carrier_batch_bytes": 2097152,
+    "new_sessions_per_minute": 600,
+    "new_sessions_burst": 128,
+    "new_streams_per_minute": 6000,
+    "new_streams_burst": 512,
+    "new_bootstraps_per_minute": 1200,
+    "new_bootstraps_burst": 256,
+    "max_sessions_per_ip": 0,
+    "max_bootstraps_per_ip": 0
+  },
+  "timeouts": {
+    "long_poll_seconds": 25,
+    "bootstrap_ttl_seconds": 120,
+    "reconnect_grace_seconds": 120
+  }
+}
