@@ -20,6 +20,9 @@ public sealed class RelayOptions
     public IPAddress? ListenAddress { get; init; }   // null = any interface
     public IPAddress? AdminAddress { get; init; }    // null = any interface
     public string TokenKeyPath { get; init; } = "token.key";
+    public string PublicDir { get; init; } = "";          // static site, read once at startup
+    public string PublicUpstream { get; init; } = "";     // reverse proxy to a loopback app
+    public bool StaticRoutesLegacy { get; init; }         // extensionless aliases for the static site
     public byte[] Secret { get; init; } = [];
 
     // -- limits (upstream tproxy-server capacity matrix) -----------------------
@@ -131,6 +134,9 @@ public sealed class RelayOptions
             PublicHostname = Ov("public_hostname", env("TPROXY_PUBLIC_HOSTNAME"), "proxy.example.com").ToLowerInvariant(),
             BasePath = Ov("base_path", env("TPROXY_BASE_PATH"), "").Trim('/'),
             CarrierMode = Ov("carrier_mode", env("TPROXY_CARRIER_MODE"), "https"),
+            PublicDir = Ov("public_dir", env("TPROXY_PUBLIC_DIR"), ""),
+            PublicUpstream = Ov("public_upstream", env("TPROXY_PUBLIC_UPSTREAM"), ""),
+            StaticRoutesLegacy = Ov("static_routes", env("TPROXY_STATIC_ROUTES"), "exact") == "legacy",
             TokenKeyPath = Ov("token_key_file", env("TPROXY_TOKEN_KEY_PATH"), "token.key"),
             Secret = secret,
             ListenPort = int.Parse(listen),

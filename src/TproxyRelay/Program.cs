@@ -31,6 +31,7 @@ var app = builder.Build();
 
 var minter = new TokenMinter(TokenMinter.LoadOrCreateKey(opt.TokenKeyPath));
 var hub = new RelayHub(opt, minter, app.Logger);
+var publicContent = PublicContent.Create(opt, app.Logger);
 _ = hub.StartReaper(app.Lifetime.ApplicationStopping);
 // Graceful shutdown: close all sessions so carriers observe a clean end
 // (Close frames / cancelled polls) instead of TCP resets; long polls (25s)
@@ -42,6 +43,12 @@ app.Logger.LogInformation(
     opt.PublicHostname, opt.BackendHost, opt.CarrierMode, opt.ListenPort, opt.AdminPort);
 
 app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromSeconds(20) });
+
+// Base-path routing (BASE_PATH.md): at the root the web path is "/", with a
+// prefix every transport endpoint moves under "/<base>/". Only the
+// trailing-slash form is served; "/<base>" without the slash is not
+// special-cased and gets the ordinary public 404.
+var webRoot = BasePaths.WebPath(opt.BasePath);
 
 // Admin listener lives on its own loopback port and never sees public traffic.
 app.Use(async (ctx, next) =>
@@ -70,7 +77,7 @@ app.Use(async (ctx, next) =>
     }
     // Carrier surface hygiene (PROTOCOL.md): HTTP API requests carry no
     // cookies, and capacity accounting needs exactly one client address.
-    if (ctx.Request.Path.StartsWithSegments("/api/v1"))
+    if (ctx.Request.Path.StartsWithSegments(webRoot + "api/v1"))
     {
         if (ctx.Request.Headers.ContainsKey("Cookie"))
         {
@@ -105,11 +112,6 @@ bool HostOk(HttpContext ctx) =>
     !opt.RequireHost ||
     string.Equals(ctx.Request.Host.Host, opt.PublicHostname, StringComparison.OrdinalIgnoreCase);
 
-// Base-path routing (BASE_PATH.md): at the root the web path is "/", with a
-// prefix every transport endpoint moves under "/<base>/". Only the
-// trailing-slash form is served; "/<base>" without the slash is not
-// special-cased and gets the ordinary public 404.
-var webRoot = BasePaths.WebPath(opt.BasePath);
 bool ExactBridgeQuery(HttpContext ctx, out string value)
 {
     value = "";
@@ -140,7 +142,7 @@ app.MapGet(webRoot, async (HttpContext ctx) =>
 {
     if (!HostOk(ctx))
     {
-        await PublicSite.NotFound(ctx);
+        await publicContent.NotFoundAsync(ctx);
         return;
     }
     if (ExactBridgeQuery(ctx, out var value) &&
@@ -162,12 +164,12 @@ app.MapGet(webRoot, async (HttpContext ctx) =>
         // capability offered here fails locally with an uncacheable 404;
         // everything else is the public home page.
         if (ExactBridgeQuery(ctx, out value))
-            await PublicSite.NotFound(ctx);
+            await publicContent.NotFoundAsync(ctx);
         else
-            await PublicSite.Index(ctx);
+            await publicContent.HomeAsync(ctx);
         return;
     }
-    await PublicSite.Index(ctx); // missing/wrong/augmented bridge query: same home page
+    await publicContent.HomeAsync(ctx); // missing/wrong/augmented bridge query: same home page
 });
 
 // -- carrier API -------------------------------------------------------------
@@ -176,13 +178,13 @@ app.MapPost(webRoot + "api/v1/session", async (HttpContext ctx) =>
 {
     if (!HostOk(ctx))
     {
-        await PublicSite.NotFound(ctx);
+        await publicContent.FallbackAsync(ctx);
         return;
     }
     var token = Bearer(ctx);
     if (token == null || !minter.TryValidate(token, TokenMinter.KindBootstrap))
     {
-        await PublicSite.NotFound(ctx); // random credentials follow the public site
+        await publicContent.FallbackAsync(ctx); // random credentials follow the public site
         return;
     }
     if (ctx.Request.ContentLength is > 64)
@@ -230,13 +232,13 @@ app.MapPost(webRoot + "api/v1/up", async (HttpContext ctx) =>
 {
     if (!HostOk(ctx))
     {
-        await PublicSite.NotFound(ctx);
+        await publicContent.FallbackAsync(ctx);
         return;
     }
     var session = hub.AuthSession(Bearer(ctx));
     if (session == null)
     {
-        await PublicSite.NotFound(ctx);
+        await publicContent.FallbackAsync(ctx);
         return;
     }
     if (!ctx.Request.Headers.TryGetValue("X-Up-Seq", out var seqStr) ||
@@ -300,13 +302,13 @@ app.MapPost(webRoot + "api/v1/down", async (HttpContext ctx) =>
 {
     if (!HostOk(ctx))
     {
-        await PublicSite.NotFound(ctx);
+        await publicContent.FallbackAsync(ctx);
         return;
     }
     var session = hub.AuthSession(Bearer(ctx));
     if (session == null)
     {
-        await PublicSite.NotFound(ctx);
+        await publicContent.FallbackAsync(ctx);
         return;
     }
     if (!ctx.Request.Headers.TryGetValue("X-Down-Cursor", out var curStr) ||
@@ -349,13 +351,13 @@ app.MapDelete(webRoot + "api/v1/session", async (HttpContext ctx) =>
 {
     if (!HostOk(ctx))
     {
-        await PublicSite.NotFound(ctx);
+        await publicContent.FallbackAsync(ctx);
         return;
     }
     var session = hub.AuthSession(Bearer(ctx));
     if (session == null)
     {
-        await PublicSite.NotFound(ctx);
+        await publicContent.FallbackAsync(ctx);
         return;
     }
     hub.CloseSession(session, "client close");
@@ -366,7 +368,7 @@ app.MapGet(webRoot + "api/v1/ws", async (HttpContext ctx) =>
 {
     if (!ctx.WebSockets.IsWebSocketRequest || !HostOk(ctx))
     {
-        await PublicSite.NotFound(ctx);
+        await publicContent.FallbackAsync(ctx);
         return;
     }
     const string prefix = "tproxy-v1.";
@@ -379,14 +381,14 @@ app.MapGet(webRoot + "api/v1/ws", async (HttpContext ctx) =>
         var dot = rest.IndexOf('.');
         if (dot != 43 || !uint.TryParse(rest[(dot + 1)..], out var sid) || sid == 0)
         {
-            await PublicSite.NotFound(ctx);
+            await publicContent.FallbackAsync(ctx);
             return;
         }
         var session = hub.AuthSession(rest[..dot]);
         if (session == null || session.CarrierMode != "websocket-lanes" ||
             session.IsTombstoned(sid) || session.Lanes.TryGetValue(sid, out var l) && l.AttachedSocket != null)
         {
-            await PublicSite.NotFound(ctx);
+            await publicContent.FallbackAsync(ctx);
             return;
         }
         var laneWs = await ctx.WebSockets.AcceptWebSocketAsync(proto);
@@ -395,21 +397,23 @@ app.MapGet(webRoot + "api/v1/ws", async (HttpContext ctx) =>
     }
     if (!proto.StartsWith(prefix, StringComparison.Ordinal))
     {
-        await PublicSite.NotFound(ctx);
+        await publicContent.FallbackAsync(ctx);
         return;
     }
     var token = proto[prefix.Length..];
     var session2 = hub.AuthSession(token);
     if (session2 == null)
     {
-        await PublicSite.NotFound(ctx);
+        await publicContent.FallbackAsync(ctx);
         return;
     }
     var ws = await ctx.WebSockets.AcceptWebSocketAsync(proto);
     await hub.RunWebSocket(session2, ws, ctx.RequestAborted);
 });
 
-app.MapFallback(async (HttpContext ctx) => await PublicSite.NotFound(ctx));
+// An explicit {*path} template (not the :nonfile default) so paths with a
+// dot — /about.html, /logo.png — also reach the public handler.
+app.MapFallback("/{*path}", async (HttpContext ctx) => await publicContent.FallbackAsync(ctx));
 
 app.Run();
 
