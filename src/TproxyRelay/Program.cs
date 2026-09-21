@@ -19,11 +19,14 @@ builder.WebHost.ConfigureKestrel(k =>
     if (opt.ListenAddress is { } la) k.Listen(la, opt.ListenPort);
     else k.ListenAnyIP(opt.ListenPort);
     if (opt.AdminAddress is { } aa) k.Listen(aa, opt.AdminPort);
-    else k.ListenAnyIP(opt.AdminPort);
+    else k.Listen(IPAddress.Loopback, opt.AdminPort); // SEC-001: admin defaults to loopback
     k.Limits.MaxRequestBodySize = 4 * 1024 * 1024;
     k.Limits.MaxRequestLineSize = 16 * 1024;
-    k.Limits.MaxConcurrentConnections = 256;
-    k.Limits.MaxConcurrentUpgradedConnections = 64;
+    // PERF-008: scale with the configured session/stream budgets instead of
+    // hard-coded 256/64 (the websocket carriers hold one upgraded connection
+    // per session — ws-lanes even one per stream).
+    k.Limits.MaxConcurrentConnections = Math.Max(256, opt.MaxSessionsGlobal * 2);
+    k.Limits.MaxConcurrentUpgradedConnections = Math.Max(64, opt.MaxStreamsGlobal);
 });
 builder.Services.Configure<HostOptions>(o => o.ShutdownTimeout = TimeSpan.FromSeconds(30));
 

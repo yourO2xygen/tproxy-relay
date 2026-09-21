@@ -109,20 +109,29 @@ public sealed class UpstreamSite : PublicContent
         {
             return;
         }
-        ctx.Response.StatusCode = (int)response.StatusCode;
-        foreach (var h in response.Headers)
+        // REL-010: the response holds an upstream connection until disposed —
+        // a client disconnect mid-stream must not leak it.
+        try
         {
-            if (HopByHop.Contains(h.Key, StringComparer.OrdinalIgnoreCase))
-                continue;
-            ctx.Response.Headers[h.Key] = h.Value.ToArray();
+            ctx.Response.StatusCode = (int)response.StatusCode;
+            foreach (var h in response.Headers)
+            {
+                if (HopByHop.Contains(h.Key, StringComparer.OrdinalIgnoreCase))
+                    continue;
+                ctx.Response.Headers[h.Key] = h.Value.ToArray();
+            }
+            foreach (var h in response.Content.Headers)
+            {
+                if (HopByHop.Contains(h.Key, StringComparer.OrdinalIgnoreCase))
+                    continue;
+                ctx.Response.Headers[h.Key] = h.Value.ToArray();
+            }
+            await response.Content.CopyToAsync(ctx.Response.Body, ctx.RequestAborted);
         }
-        foreach (var h in response.Content.Headers)
+        finally
         {
-            if (HopByHop.Contains(h.Key, StringComparer.OrdinalIgnoreCase))
-                continue;
-            ctx.Response.Headers[h.Key] = h.Value.ToArray();
+            response.Dispose();
         }
-        await response.Content.CopyToAsync(ctx.Response.Body, ctx.RequestAborted);
     }
 }
 

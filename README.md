@@ -205,9 +205,20 @@ MTProxy за docker-NAT обязан представляться middle-end'у 
   `tproxy_limit_hits_total`.
 - Юнит-тесты: `dotnet test tests/TproxyRelay.Tests`; CI: build + test + docker build.
 
-## Упрощения относительно референса
+## Отличия от референса
 
-- Один профиль/секрет (не список), режимы https-lanes/websocket-lanes не реализованы.
-- Токены хранятся в памяти как есть (не хэш), нет per-IP лимитов и rate buckets.
-- WINDOW не коалесцируются; pending-бюджет грубый (только по client DATA).
-- X-Forwarded-For не обрабатывается (per-IP лимиты выключены, как в референсе по умолчанию).
+Паритет с tproxy-server достигнут по функциональности (фазы 4–10); перечислены
+сознательные отличия реализации, а не отсутствующие функции.
+
+- Носители: все четыре режима (`https`, `websocket`, `https-lanes`,
+  `websocket-lanes`) с lane-scoped seq/cursor/replay; ключи — полноценный
+  реестр в SQLite (создание/отзыв/пауза/трафик) вместо одного секрета.
+- Токены хранятся в памяти как есть (не хэш) — как в референсе; секрет в
+  token.key в volume.
+- WINDOW коалесцируются (GrantPending); pending-бюджет трёхуровневый:
+  per-session + global (байты и элементы) + per-lane в lanes-режимах.
+- X-Forwarded-For принимается строго одним значением (список → 400); при
+  выключенных per-IP лимитах — как в референсе по умолчанию.
+- Поверх референса: base-path деплой (v2-capability, слаг, маркированные
+  ссылки t.me), public_dir/public_upstream сайты, Admin API (loopback,
+  fail-closed) и Telegram-бот управления ключами.

@@ -276,7 +276,35 @@ public sealed partial class RelayHub
         session.DownQueue.Writer.TryComplete();
         foreach (var st in session.Streams.Values)
             CloseStreamInternal(session, st);
+        DrainSessionCharges(session);
+        foreach (var lane in session.Lanes.Values)
+            lane.ReleaseAll(session);
         _log.LogInformation("event=session_closed reason={Reason}", reason);
+    }
+
+    /// <summary>
+    /// REL-001: once the carriers are gone nobody drains the queues — release
+    /// every outstanding charge of a dead session here, or the global downlink
+    /// gate slowly absorbs its budget (guaranteed self-DoS after enough client
+    /// disconnects). Exactly-once per session (guarded by MarkDead); frames are
+    /// claimed atomically via TryRead, so racing carriers each release exactly
+    /// their own share.
+    /// </summary>
+    private static void DrainSessionCharges(Session session)
+    {
+        while (session.DownQueue.Reader.TryRead(out var f))
+        {
+            ReleaseCharge(session, f.Length, 1);
+            f.Return();
+        }
+        lock (session.Sync)
+        {
+            if (session.PendingBatch != null)
+            {
+                ReleaseCharge(session, session.PendingBatch.Length, session.PendingBatchFrames);
+                session.PendingBatch = null;
+            }
+        }
     }
 
     public int BootstrapCount => _bootstraps.Count;
@@ -290,11 +318,20 @@ public sealed partial class RelayHub
             try { await Task.Delay(TimeSpan.FromSeconds(15), ct); }
             catch (OperationCanceledException) { break; }
             var now = DateTime.UtcNow;
+            // REL-011: one broken session must never kill the idle reaper —
+            // silent death here would pin every session slot forever.
             foreach (var s in _sessions.Values)
             {
-                if ((now - s.LastActivity).TotalSeconds > _opt.ReconnectGraceSeconds)
-                    CloseSession(s, "idle");
-                AggregateTraffic(s);
+                try
+                {
+                    if ((now - s.LastActivity).TotalSeconds > _opt.ReconnectGraceSeconds)
+                        CloseSession(s, "idle");
+                    AggregateTraffic(s);
+                }
+                catch (Exception e)
+                {
+                    _log.LogError("event=reaper_session_failed err={Error}", e.Message);
+                }
             }
             foreach (var kv in _bootstraps)
                 if (kv.Value.Expiry < now)
@@ -641,6 +678,7 @@ public sealed partial class RelayHub
     {
         if (session.Dead)
         {
+            _log.LogDebug("event=frame_dropped reason=session_dead type={Type} id={Id}", frame.Span[0], (uint)((frame.Span[1] << 16) | (frame.Span[2] << 8) | frame.Span[3]));
             frame.Return();
             return;
         }
@@ -652,13 +690,14 @@ public sealed partial class RelayHub
         await EnqueueDownMuxAsync(session, frame);
     }
 
-    private async ValueTask EnqueueDownLaneAsync(Session session, FrameBuf frame)
+    internal async ValueTask EnqueueDownLaneAsync(Session session, FrameBuf frame)
     {
         // Lanes carrier: every relay frame belongs to the lane of its stream id.
         var sid = (uint)((frame.Span[1] << 16) | (frame.Span[2] << 8) | frame.Span[3]);
         if (!session.Lanes.TryGetValue(sid, out var lane))
         {
             // Tombstone-evicted or never-opened lane: late frames are ignored.
+            _log.LogDebug("event=frame_dropped reason=unknown_lane lane={Lane}", sid);
             frame.Return();
             return;
         }
@@ -697,8 +736,8 @@ public sealed partial class RelayHub
             return;
         }
         try { await lane.Queue.Writer.WriteAsync(frame, session.Cts.Token); }
-        catch (ChannelClosedException) { ReleaseLaneCharge(session, lane, frame.Length, 1); frame.Return(); }
-        catch (OperationCanceledException) { ReleaseLaneCharge(session, lane, frame.Length, 1); frame.Return(); }
+        catch (ChannelClosedException) { ReleaseLaneCharge(session, lane, frame.Length, 1); frame.Return(); _log.LogDebug("event=frame_dropped reason=lane_queue_closed lane={Lane}", sid); }
+        catch (OperationCanceledException) { ReleaseLaneCharge(session, lane, frame.Length, 1); frame.Return(); _log.LogDebug("event=frame_dropped reason=lane_session_canceled lane={Lane}", sid); }
     }
 
     private static void ReleaseLaneCharge(Session session, LaneState lane, int encodedBytes, int items)
@@ -712,7 +751,7 @@ public sealed partial class RelayHub
         Counters.PendingItems(-items);
     }
 
-    private async ValueTask EnqueueDownMuxAsync(Session session, FrameBuf frame)
+    internal async ValueTask EnqueueDownMuxAsync(Session session, FrameBuf frame)
     {
         var charge = frame.Length + ItemOverhead;
         Interlocked.Add(ref session.PendingBytes, charge);
@@ -742,8 +781,8 @@ public sealed partial class RelayHub
         // per-stream frame order. No fire-and-forget fallback: that reordered
         // frames and grew an unbounded task backlog.
         try { await session.DownQueue.Writer.WriteAsync(frame, session.Cts.Token); }
-        catch (ChannelClosedException) { ReleaseCharge(session, frame.Length, 1); frame.Return(); }
-        catch (OperationCanceledException) { ReleaseCharge(session, frame.Length, 1); frame.Return(); }
+        catch (ChannelClosedException) { ReleaseCharge(session, frame.Length, 1); frame.Return(); _log.LogDebug("event=frame_dropped reason=queue_closed"); }
+        catch (OperationCanceledException) { ReleaseCharge(session, frame.Length, 1); frame.Return(); _log.LogDebug("event=frame_dropped reason=session_canceled"); }
     }
 
     /// <summary>Releases the byte+item charge of drained frames.</summary>
@@ -877,6 +916,15 @@ public sealed partial class RelayHub
             long newCursor;
             lock (session.Sync)
             {
+                if (session.Dead)
+                {
+                    // Raced CloseSession after our TryReads: never install a
+                    // batch on a dead session — with no acker left its charge
+                    // would leak into the global gauges (REL-001).
+                    ReleaseCharge(session, body.Length, frameCount);
+                    Counters.DownBatch(body.Length);
+                    return DownResult.Empty(cursor);
+                }
                 session.PendingCursor = session.AckedCursor + 1;
                 session.PendingBatch = body;
                 session.PendingBatchFrames = frameCount;
@@ -894,6 +942,7 @@ public sealed partial class RelayHub
         {
             Interlocked.CompareExchange(ref session.ActivePoll, null, myCancel);
             session.DownCollect.Release();
+            myCancel.Dispose(); // REL-013: per-poll CTS must not leak
         }
     }
 

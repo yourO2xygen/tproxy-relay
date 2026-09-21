@@ -44,9 +44,9 @@ public sealed class RelayOptions
     public int MaxStreamsPerSession { get; init; } = 128;
     public int MaxBackendDialsInFlight { get; init; } = 256;
     public int MaxBootstrapsGlobal { get; init; } = 512;
-    public long MaxPendingBytesGlobal { get; init; } = 512 * 1024 * 1024;
+    public long MaxPendingBytesGlobal { get; init; } = 256 * 1024 * 1024;
     public long MaxPendingItemsGlobal { get; init; } = 262144;
-    public long MaxPendingBytesPerSession { get; init; } = 32 * 1024 * 1024;
+    public long MaxPendingBytesPerSession { get; init; } = 16 * 1024 * 1024;
     public int MaxFramePayload { get; init; } = 1024 * 1024;
     public int DownBatchTargetBytes { get; init; } = 2 * 1024 * 1024;
     public double NewSessionsPerMinute { get; init; } = 600;
@@ -154,6 +154,10 @@ public sealed class RelayOptions
 
         var listen = Endpoint("listen", env("TPROXY_LISTEN"), env("TPROXY_LISTEN_PORT"), 8080, out var listenAddr);
         var admin = Endpoint("admin_listen", env("TPROXY_ADMIN_LISTEN"), env("TPROXY_ADMIN_PORT"), 8081, out var adminAddr);
+        // SEC-001: metrics/admin is bearer-less on purpose — default it to the
+        // loopback. Exposing it is an explicit TPROXY_ADMIN_LISTEN decision
+        // (e.g. inside a container with a host-loopback port mapping).
+        adminAddr ??= IPAddress.Loopback;
 
         var opt = new RelayOptions(Ov("backend", env("TPROXY_BACKEND_HOST"), "backend-stub:9000"))
         {
@@ -175,9 +179,9 @@ public sealed class RelayOptions
             MaxStreamsPerSession = Int(Ov("limits.max_streams_per_session", env("TPROXY_MAX_STREAMS_PER_SESSION"), "128")),
             MaxBackendDialsInFlight = Int(Ov("limits.max_backend_dials_in_flight", env("TPROXY_MAX_DIALS_IN_FLIGHT"), "256")),
             MaxBootstrapsGlobal = Int(Ov("limits.max_bootstraps_global", env("TPROXY_MAX_BOOTSTRAPS"), "512")),
-            MaxPendingBytesGlobal = Long(Ov("limits.max_pending_global_bytes", env("TPROXY_MAX_PENDING_GLOBAL_BYTES"), (512 * 1024 * 1024).ToString())),
+            MaxPendingBytesGlobal = Long(Ov("limits.max_pending_global_bytes", env("TPROXY_MAX_PENDING_GLOBAL_BYTES"), (256 * 1024 * 1024).ToString())),
             MaxPendingItemsGlobal = Long(Ov("limits.max_pending_global_items", env("TPROXY_MAX_PENDING_GLOBAL_ITEMS"), "262144")),
-            MaxPendingBytesPerSession = Long(Ov("limits.max_pending_per_session", env("TPROXY_MAX_PENDING_PER_SESSION_BYTES"), (32 * 1024 * 1024).ToString())),
+            MaxPendingBytesPerSession = Long(Ov("limits.max_pending_per_session", env("TPROXY_MAX_PENDING_PER_SESSION_BYTES"), (16 * 1024 * 1024).ToString())),
             MaxFramePayload = Int(Ov("limits.max_frame_payload", env("TPROXY_MAX_FRAME_PAYLOAD"), (1024 * 1024).ToString())),
             DownBatchTargetBytes = Int(Ov("limits.carrier_batch_bytes", env("TPROXY_CARRIER_BATCH_BYTES"), (2 * 1024 * 1024).ToString())),
             NewSessionsPerMinute = Dbl(Ov("limits.new_sessions_per_minute", env("TPROXY_NEW_SESSIONS_PER_MINUTE"), "600")),

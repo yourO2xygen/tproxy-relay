@@ -33,10 +33,18 @@ public sealed class LaneState(uint id)
     public int QueuedItems;
     public volatile bool StreamClosed;
     public WebSocket? AttachedSocket;     // websocket-lanes: one socket per lane
+    private int _released;
 
-    /// <summary>Tombstone eviction path: release everything the lane still held.</summary>
+    /// <summary>
+    /// Tombstone-eviction and session-close path: release everything the lane
+    /// still held. Exactly-once (eviction can race CloseSession) and the
+    /// PendingBatch release happens under Sync — the GetDownLane ack path
+    /// clears it under the same lock (REL-018 double-release race).
+    /// </summary>
     public void ReleaseAll(Session session)
     {
+        if (Interlocked.Exchange(ref _released, 1) == 1)
+            return;
         Queue.Writer.TryComplete();
         while (Queue.Reader.TryRead(out var f))
         {
@@ -45,12 +53,15 @@ public sealed class LaneState(uint id)
             Interlocked.Decrement(ref QueuedItems);
             f.Return();
         }
-        if (PendingBatch != null)
+        lock (Sync)
         {
-            RelayHub.ReleaseCharge(session, PendingBatch.Length, PendingBatchFrames);
-            Interlocked.Add(ref QueuedCharge, -(PendingBatch.Length + RelayHub.ItemOverhead * PendingBatchFrames));
-            Interlocked.Add(ref QueuedItems, -PendingBatchFrames);
-            PendingBatch = null;
+            if (PendingBatch != null)
+            {
+                RelayHub.ReleaseCharge(session, PendingBatch.Length, PendingBatchFrames);
+                Interlocked.Add(ref QueuedCharge, -(PendingBatch.Length + RelayHub.ItemOverhead * PendingBatchFrames));
+                Interlocked.Add(ref QueuedItems, -PendingBatchFrames);
+                PendingBatch = null;
+            }
         }
     }
 }
@@ -286,6 +297,15 @@ public sealed partial class RelayHub
             long newCursor;
             lock (lane.Sync)
             {
+                if (session.Dead)
+                {
+                    // Raced CloseSession (which releases the lane via
+                    // ReleaseAll): installing the batch now would leak its
+                    // charge with no acker left (REL-001).
+                    ReleaseLaneCharge(session, lane, body.Length, frameCount);
+                    Counters.DownBatch(body.Length);
+                    return DownResult.Empty(cursor);
+                }
                 lane.PendingCursor = lane.AckedCursor + 1;
                 lane.PendingBatch = body;
                 lane.PendingBatchFrames = frameCount;
@@ -303,6 +323,7 @@ public sealed partial class RelayHub
         {
             Interlocked.CompareExchange(ref lane.ActivePoll, null, myCancel);
             lane.Collect.Release();
+            myCancel.Dispose(); // REL-013: per-poll CTS must not leak
         }
     }
 

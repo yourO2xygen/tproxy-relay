@@ -48,6 +48,11 @@ TPROXY_SECRET_HEX=$SECRET
 TPROXY_CARRIER_MODE=https
 TPROXY_BASE_PATH=$BASE_PATH
 MTPROXY_PUBLIC_IP=$PUB_IP
+# Управление (опционально): Admin API и Telegram-бот.
+# TPROXY_API_ENABLED=true + TPROXY_API_TOKEN=$(openssl rand -hex 24)
+# TPROXY_BOT_ENABLED=true
+# TPROXY_BOT_TOKEN=<токен от @BotFather>
+# TPROXY_BOT_ADMINS=<chat-id: напишите боту и найдите event=tg_stranger в логах>
 EOF
     chmod 600 .env
     echo ".env создан (chmod 600)."

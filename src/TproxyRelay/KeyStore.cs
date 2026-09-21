@@ -62,6 +62,20 @@ public sealed class KeyStore
               PRIMARY KEY (day, key_id)
             );
             """, db).ExecuteNonQuery();
+        // API-004/REL-016: parallel Create() calls must never share a backend
+        // port. Partial index: revoked rows keep their ports but do not block
+        // reuse by a later active key.
+        new SqliteCommand(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_keys_backend_port_active ON keys(backend_port) WHERE revoked_utc IS NULL",
+            db).ExecuteNonQuery();
+        RestrictPermissions(_dbPath);
+    }
+
+    /// <summary>SEC-003: the key database is a secret registry — owner-only.</summary>
+    internal static void RestrictPermissions(string path)
+    {
+        try { File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite); }
+        catch { /* non-unix filesystems: best effort */ }
     }
 
     private SqliteConnection Open()
@@ -116,21 +130,35 @@ public sealed class KeyStore
         var secret = secretHex ?? Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
         if (!SecretLooksValid(secret))
             throw new ArgumentException("secret must be 32 hex characters (16 bytes)", nameof(secretHex));
-        var port = AllocatePort();
         var id = Guid.NewGuid().ToString("N");
-        using var db = Open();
-        using var cmd = db.CreateCommand();
-        cmd.CommandText = """
-            INSERT INTO keys (id,name,secret_hex,created_utc,revoked_utc,paused,backend_port)
-            VALUES ($id,$name,$secret,$created,NULL,0,$port)
-            """;
-        cmd.Parameters.AddWithValue("$id", id);
-        cmd.Parameters.AddWithValue("$name", name);
-        cmd.Parameters.AddWithValue("$secret", secret);
-        cmd.Parameters.AddWithValue("$created", DateTime.UtcNow.ToString("O"));
-        cmd.Parameters.AddWithValue("$port", port);
-        cmd.ExecuteNonQuery();
-        return Get(id)!;
+        for (var attempt = 0; ; attempt++)
+        {
+            var port = AllocatePort();
+            using var db = Open();
+            using var cmd = db.CreateCommand();
+            cmd.CommandText = """
+                INSERT INTO keys (id,name,secret_hex,created_utc,revoked_utc,paused,backend_port)
+                VALUES ($id,$name,$secret,$created,NULL,0,$port)
+                """;
+            cmd.Parameters.AddWithValue("$id", id);
+            cmd.Parameters.AddWithValue("$name", name);
+            cmd.Parameters.AddWithValue("$secret", secret);
+            cmd.Parameters.AddWithValue("$created", DateTime.UtcNow.ToString("O"));
+            cmd.Parameters.AddWithValue("$port", port);
+            try
+            {
+                cmd.ExecuteNonQuery();
+            }
+            catch (SqliteException e) when (attempt < 8 &&
+                                            e.SqliteErrorCode == 19 &&
+                                            e.Message.Contains("backend_port"))
+            {
+                // Lost the port race to a concurrent Create (API-004): the
+                // unique index stopped the duplicate — re-allocate and retry.
+                continue;
+            }
+            return Get(id)!;
+        }
     }
 
     public bool Revoke(string id)
@@ -230,7 +258,7 @@ public sealed class KeyStore
         var tmp = path + ".tmp";
         File.WriteAllText(tmp, string.Join('\n', lines) + "\n");
         File.Move(tmp, path, overwrite: true);
-        try { File.WriteAllText(path + ".mode", "0600"); } catch { /* best effort */ }
+        RestrictPermissions(path); // SEC-003: real file mode instead of a marker
     }
 
     // ---- seed (static operations without the management layer) -----------------

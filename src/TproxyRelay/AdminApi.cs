@@ -67,8 +67,9 @@ public static class AdminApi
                 {
                     k.Id, k.Name, k.BackendPort, k.CreatedUtc, k.RevokedUtc, k.Paused, k.Active,
                     // The secret is the operator's own credential: only over the
-                    // loopback admin listener, and only with ?reveal=1.
-                    secret_hex = ctx.Request.Query.ContainsKey("reveal") ? k.SecretHex : null,
+                    // loopback admin listener, and only with ?reveal=1 (API-005:
+                    // any other value must keep it hidden).
+                    secret_hex = ctx.Request.Query["reveal"] == "1" ? k.SecretHex : null,
                 }),
             }, JsonOpts));
         });

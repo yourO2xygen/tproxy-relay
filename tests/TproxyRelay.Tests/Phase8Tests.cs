@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Xunit;
 using Microsoft.Extensions.Logging.Abstractions;
 using TproxyRelay;
@@ -8,6 +9,18 @@ public sealed class KeyStoreTests : IDisposable
 {
     private readonly string _db = Path.Combine(Path.GetTempPath(), "tproxy-ks-" + Guid.NewGuid().ToString("N")[..8] + ".db");
     private KeyStore Store() => new(_db);
+
+    [Fact]
+    public void Parallel_Creates_Allocate_Distinct_Ports()
+    {
+        // API-004/REL-016: concurrent Create() calls must never collide on a
+        // backend port (the unique index turns the race into a retry).
+        var store = Store();
+        var ports = new ConcurrentBag<int>();
+        Parallel.ForEach(Enumerable.Range(0, 16),
+            i => ports.Add(store.Create($"race{i}").BackendPort));
+        Assert.Equal(16, ports.Distinct().Count());
+    }
 
     [Fact]
     public void Create_List_Get_Revoke()

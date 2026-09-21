@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Xunit;
 using Microsoft.Extensions.Logging.Abstractions;
 using TproxyRelay;
@@ -61,6 +62,16 @@ public sealed class TelegramBotTests : IDisposable
         Assert.Equal("999 B", TelegramBot.Fmt(999));
         Assert.Equal("1.5 KiB", TelegramBot.Fmt(1536));
         Assert.Equal("2.0 MiB", TelegramBot.Fmt((long)(2.0 * (1 << 20))));
+    }
+
+    [Fact]
+    public void ParseRetryAfter_Reads_Flood_Control_Window()
+    {
+        using var doc = JsonDocument.Parse("""{"ok":false,"description":"Too Many Requests","parameters":{"retry_after":7}}""");
+        Assert.Equal(7, TelegramBot.ParseRetryAfter(doc.RootElement));
+
+        using var none = JsonDocument.Parse("""{"ok":false,"description":"Unauthorized"}""");
+        Assert.Equal(0, TelegramBot.ParseRetryAfter(none.RootElement));
     }
 
     public void Dispose()
