@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Xunit;
 using Microsoft.Extensions.Logging.Abstractions;
 using TproxyRelay;
@@ -8,6 +9,31 @@ public sealed class KeyStoreTests : IDisposable
 {
     private readonly string _db = Path.Combine(Path.GetTempPath(), "tproxy-ks-" + Guid.NewGuid().ToString("N")[..8] + ".db");
     private KeyStore Store() => new(_db);
+
+    [Fact]
+    public void Parallel_Creates_Allocate_Distinct_Ports()
+    {
+        // API-004/REL-016: concurrent Create() calls must never collide on a
+        // backend port (the unique index turns the race into a retry).
+        var store = Store();
+        var ports = new ConcurrentBag<int>();
+        Parallel.ForEach(Enumerable.Range(0, 16),
+            i => ports.Add(store.Create($"race{i}").BackendPort));
+        Assert.Equal(16, ports.Distinct().Count());
+    }
+
+    [Fact]
+    public void AllocatePort_Is_Sequential_And_Revoked_Ports_Are_Reusable()
+    {
+        var store = Store();
+        var a = store.Create("first");
+        var b = store.Create("second");
+        Assert.Equal(KeyStore.BasePort + 1, a.BackendPort);
+        Assert.Equal(KeyStore.BasePort + 2, b.BackendPort);
+        store.Revoke(a.Id);
+        var c = store.Create("third");
+        Assert.Equal(a.BackendPort, c.BackendPort); // freed port is reused
+    }
 
     [Fact]
     public void Create_List_Get_Revoke()
@@ -109,8 +135,9 @@ public sealed class KeyStoreTests : IDisposable
 
     public void Dispose()
     {
-        try { Directory.Delete(Path.GetDirectoryName(_db)!, false); } catch { /* temp cleanup */ }
-        try { File.Delete(_db); } catch { }
+        // TEST-010: clean every SQLite sidecar, not just the main db file.
+        foreach (var suffix in new[] { "", "-journal", "-wal", "-shm" })
+            try { File.Delete(_db + suffix); } catch { /* best effort */ }
     }
 }
 

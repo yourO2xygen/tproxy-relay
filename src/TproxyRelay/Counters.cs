@@ -1,5 +1,13 @@
 namespace TproxyRelay;
 
+/// <summary>Point-in-time copy of all counters (ARCH-003: management code
+/// reads this instead of parsing its own Prometheus text).</summary>
+public sealed record StatsSnapshot(
+    long SessionsCreated, long SessionsActive, long StreamsActive, long BootstrapsMinted,
+    long UpBatches, long DownBatches, long UpBytes, long DownBytes,
+    long FramesIn, long FramesOut, long LimitHits, long PendingBytes, long PendingItems,
+    long DialsInFlight);
+
 public static class Counters
 {
     private static long _sessionsCreated, _sessionsActive, _streamsActive, _bootstrapsMinted;
@@ -8,6 +16,15 @@ public static class Counters
 
     public static long PendingBytesGauge => Volatile.Read(ref _pendingBytes);
     public static long PendingItemsGauge => Volatile.Read(ref _pendingItems);
+
+    public static StatsSnapshot Snapshot() => new(
+        Volatile.Read(ref _sessionsCreated), Volatile.Read(ref _sessionsActive),
+        Volatile.Read(ref _streamsActive), Volatile.Read(ref _bootstrapsMinted),
+        Volatile.Read(ref _upBatches), Volatile.Read(ref _downBatches),
+        Volatile.Read(ref _upBytes), Volatile.Read(ref _downBytes),
+        Volatile.Read(ref _framesIn), Volatile.Read(ref _framesOut),
+        Volatile.Read(ref _limitHits), Volatile.Read(ref _pendingBytes),
+        Volatile.Read(ref _pendingItems), Volatile.Read(ref _dialsInFlight));
 
     public static void SessionCreated() => Interlocked.Increment(ref _sessionsCreated);
     public static void SessionActiveUp() => Interlocked.Increment(ref _sessionsActive);

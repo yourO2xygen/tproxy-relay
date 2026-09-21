@@ -5,6 +5,8 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
+    <!-- DEP-004: locked restore — the lock file is committed and CI enforces it. -->
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
     <ServerGarbageCollection>true</ServerGarbageCollection>
     <InvariantGlobalization>true</InvariantGlobalization>
     <AllowMissingPrunePackageData>true</AllowMissingPrunePackageData>
@@ -13,7 +15,7 @@
   <ItemGroup>
     <InternalsVisibleTo Include="TproxyRelay.Tests" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
-    <PackageReference Include="System.IO.Hashing" Version="10.0.0" />
+    <PackageReference Include="System.IO.Hashing" Version="10.0.12" />
   </ItemGroup>
 
 </Project>

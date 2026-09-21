@@ -98,13 +98,29 @@ public sealed class TokenMinter(byte[] key)
             var existing = File.ReadAllBytes(path);
             if (existing.Length >= 32)
                 return existing[..32];
-            throw new InvalidOperationException($"token key file {path} is too short");
+            // REL-007: a corrupt key must fail with a clear instruction, not a
+            // mysterious crash loop.
+            throw new InvalidOperationException(
+                $"token key file {path} is corrupt ({existing.Length} bytes, need at least 32): " +
+                "restore it from a backup, or remove the file and restart — every existing client session will be invalidated");
         }
         var directory = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(directory))
             Directory.CreateDirectory(directory);
         var key = RandomNumberGenerator.GetBytes(32);
-        File.WriteAllBytes(path, key);
+        // REL-007: atomic write — a crash mid-write must never leave a
+        // half-written key behind.
+        var tmp = path + ".tmp";
+        File.WriteAllBytes(tmp, key);
+        try
+        {
+            KeyStore.RestrictPermissions(tmp);
+            File.Move(tmp, path, overwrite: true);
+        }
+        catch (System.PlatformNotSupportedException)
+        {
+            File.Move(tmp, path, overwrite: true);
+        }
         return key;
     }
 }

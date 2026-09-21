@@ -17,13 +17,16 @@ public class RateBucketTests
     }
 
     [Fact]
-    public async Task Refills_Over_Time()
+    public void Refills_Over_Time()
     {
-        var b = new RateBucket(6000, 1); // 100/sec
+        // TEST-008: a virtual clock instead of a real Task.Delay(120).
+        var t = 0L; // ms
+        var b = new RateBucket(6000, 1, () => t * TimeSpan.TicksPerMillisecond);
         Assert.True(b.TryTake());
         Assert.False(b.TryTake());
-        await Task.Delay(120);
+        t += 20; // 20ms at 100/sec refills 2 tokens, capped at burst 1
         Assert.True(b.TryTake());
+        Assert.False(b.TryTake());
     }
 
     [Fact]
@@ -157,7 +160,7 @@ public class Phase4HubTests : IAsyncLifetime
         {
             var down = await hub.GetDown(session, 0, cts.Token);
             if (!down.HasBatch) continue;
-            foreach (var f in FrameCodec.ParseAll(down.Body!))
+            foreach (var f in FrameCodec.ParseAll(down.Body!.Payload))
                 if (f.Type == FrameType.Close && f.StreamId == 6)
                     sawClose6 = true;
         }
@@ -237,7 +240,7 @@ public class Phase4HubTests : IAsyncLifetime
         for (var i = 0; i < 20; i++)
         {
             down = await _hub.GetDown(session, 0, cts.Token);
-            if (down.HasBatch && FrameCodec.ParseAll(down.Body!).Any(f => f.Type == FrameType.Data))
+            if (down.HasBatch && FrameCodec.ParseAll(down.Body!.Payload).Any(f => f.Type == FrameType.Data))
                 break;
         }
         Assert.True(down.HasBatch);

@@ -35,15 +35,22 @@ public sealed class KeyStore
         var dir = Path.GetDirectoryName(Path.GetFullPath(dbPath));
         if (!string.IsNullOrEmpty(dir))
             Directory.CreateDirectory(dir);
-        _connectionString = new SqliteConnectionStringBuilder { DataSource = dbPath, Mode = SqliteOpenMode.ReadWriteCreate }.ToString();
+        _connectionString = new SqliteConnectionStringBuilder { DataSource = dbPath, Mode = SqliteOpenMode.ReadWriteCreate, Pooling = true }.ToString();
         Init();
     }
 
     public string DataDirectory => Path.GetDirectoryName(Path.GetFullPath(_dbPath))!;
 
+    /// <summary>API-003: schema version. Bump and append a migration step
+    /// below; migration is forward-only and idempotent (IF NOT EXISTS).</summary>
+    private const long SchemaVersion = 1;
+
     private void Init()
     {
         using var db = Open();
+        long version;
+        using (var v = new SqliteCommand("PRAGMA user_version", db))
+            version = (long)(v.ExecuteScalar() ?? 0L);
         new SqliteCommand("""
             CREATE TABLE IF NOT EXISTS keys (
               id TEXT PRIMARY KEY,
@@ -62,12 +69,39 @@ public sealed class KeyStore
               PRIMARY KEY (day, key_id)
             );
             """, db).ExecuteNonQuery();
+        // PERF-006: WAL — concurrent readers never block the reaper's writes.
+        new SqliteCommand("PRAGMA journal_mode=WAL", db).ExecuteNonQuery();
+        if (version < 1)
+        {
+            // 001 (API-004/REL-016): parallel Create() calls must never share
+            // a backend port. Partial index: revoked rows keep their ports
+            // but do not block reuse by a later active key.
+            new SqliteCommand(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_keys_backend_port_active ON keys(backend_port) WHERE revoked_utc IS NULL",
+                db).ExecuteNonQuery();
+        }
+        if (version < SchemaVersion)
+            new SqliteCommand($"PRAGMA user_version={SchemaVersion}", db).ExecuteNonQuery();
+        RestrictPermissions(_dbPath);
+    }
+
+    /// <summary>SEC-003: the key database is a secret registry — owner-only.</summary>
+    internal static void RestrictPermissions(string path)
+    {
+        try { File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite); }
+        catch { /* non-unix filesystems: best effort */ }
     }
 
     private SqliteConnection Open()
     {
         var conn = new SqliteConnection(_connectionString);
         conn.Open();
+        // PERF-006: never fail on a brief write lock from the reaper.
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = "PRAGMA busy_timeout=5000";
+            cmd.ExecuteNonQuery();
+        }
         return conn;
     }
 
@@ -116,21 +150,35 @@ public sealed class KeyStore
         var secret = secretHex ?? Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
         if (!SecretLooksValid(secret))
             throw new ArgumentException("secret must be 32 hex characters (16 bytes)", nameof(secretHex));
-        var port = AllocatePort();
         var id = Guid.NewGuid().ToString("N");
-        using var db = Open();
-        using var cmd = db.CreateCommand();
-        cmd.CommandText = """
-            INSERT INTO keys (id,name,secret_hex,created_utc,revoked_utc,paused,backend_port)
-            VALUES ($id,$name,$secret,$created,NULL,0,$port)
-            """;
-        cmd.Parameters.AddWithValue("$id", id);
-        cmd.Parameters.AddWithValue("$name", name);
-        cmd.Parameters.AddWithValue("$secret", secret);
-        cmd.Parameters.AddWithValue("$created", DateTime.UtcNow.ToString("O"));
-        cmd.Parameters.AddWithValue("$port", port);
-        cmd.ExecuteNonQuery();
-        return Get(id)!;
+        for (var attempt = 0; ; attempt++)
+        {
+            var port = AllocatePort();
+            using var db = Open();
+            using var cmd = db.CreateCommand();
+            cmd.CommandText = """
+                INSERT INTO keys (id,name,secret_hex,created_utc,revoked_utc,paused,backend_port)
+                VALUES ($id,$name,$secret,$created,NULL,0,$port)
+                """;
+            cmd.Parameters.AddWithValue("$id", id);
+            cmd.Parameters.AddWithValue("$name", name);
+            cmd.Parameters.AddWithValue("$secret", secret);
+            cmd.Parameters.AddWithValue("$created", DateTime.UtcNow.ToString("O"));
+            cmd.Parameters.AddWithValue("$port", port);
+            try
+            {
+                cmd.ExecuteNonQuery();
+            }
+            catch (SqliteException e) when (attempt < 8 &&
+                                            e.SqliteErrorCode == 19 &&
+                                            e.Message.Contains("backend_port"))
+            {
+                // Lost the port race to a concurrent Create (API-004): the
+                // unique index stopped the duplicate — re-allocate and retry.
+                continue;
+            }
+            return Get(id)!;
+        }
     }
 
     public bool Revoke(string id)
@@ -177,21 +225,33 @@ public sealed class KeyStore
 
     // ---- traffic ------------------------------------------------------------
 
-    public void AggregateTraffic(string keyId, long upDelta, long downDelta, DateOnly? day = null)
+    public void AggregateTraffic(string keyId, long upDelta, long downDelta, DateOnly? day = null) =>
+        AggregateTrafficBatch([(keyId, upDelta, downDelta)], day);
+
+    /// <summary>
+    /// PERF-006: the reaper flushes every session's deltas in one statement
+    /// instead of one INSERT per session.
+    /// </summary>
+    public void AggregateTrafficBatch(IReadOnlyList<(string KeyId, long Up, long Down)> deltas, DateOnly? day = null)
     {
-        if (upDelta == 0 && downDelta == 0)
+        if (deltas.Count == 0)
             return;
         var d = (day ?? DateOnly.FromDateTime(DateTime.UtcNow)).ToString("yyyy-MM-dd");
         using var db = Open();
         using var cmd = db.CreateCommand();
-        cmd.CommandText = """
-            INSERT INTO traffic_daily (day,key_id,up_bytes,down_bytes) VALUES ($day,$key,$up,$down)
-            ON CONFLICT (day,key_id) DO UPDATE SET up_bytes=up_bytes+$up, down_bytes=down_bytes+$down
+        var values = new string[deltas.Count];
+        for (var i = 0; i < deltas.Count; i++)
+        {
+            values[i] = $"($day,$key{i},$up{i},$down{i})";
+            cmd.Parameters.AddWithValue($"$key{i}", deltas[i].KeyId);
+            cmd.Parameters.AddWithValue($"$up{i}", deltas[i].Up);
+            cmd.Parameters.AddWithValue($"$down{i}", deltas[i].Down);
+        }
+        cmd.CommandText = $"""
+            INSERT INTO traffic_daily (day,key_id,up_bytes,down_bytes) VALUES {string.Join(",", values)}
+            ON CONFLICT (day,key_id) DO UPDATE SET up_bytes=up_bytes+excluded.up_bytes, down_bytes=down_bytes+excluded.down_bytes
             """;
         cmd.Parameters.AddWithValue("$day", d);
-        cmd.Parameters.AddWithValue("$key", keyId);
-        cmd.Parameters.AddWithValue("$up", upDelta);
-        cmd.Parameters.AddWithValue("$down", downDelta);
         cmd.ExecuteNonQuery();
     }
 
@@ -230,7 +290,7 @@ public sealed class KeyStore
         var tmp = path + ".tmp";
         File.WriteAllText(tmp, string.Join('\n', lines) + "\n");
         File.Move(tmp, path, overwrite: true);
-        try { File.WriteAllText(path + ".mode", "0600"); } catch { /* best effort */ }
+        RestrictPermissions(path); // SEC-003: real file mode instead of a marker
     }
 
     // ---- seed (static operations without the management layer) -----------------

@@ -106,7 +106,7 @@ public class RelayHubTests : IAsyncLifetime
         using var cts = new CancellationTokenSource(timeoutMs);
         var down = await _hub.GetDown(session, cursor, cts.Token);
         if (!down.HasBatch) return [];
-        return FrameCodec.ParseAll(down.Body!);
+        return FrameCodec.ParseAll(down.Body!.Payload);
     }
 
     [Fact]

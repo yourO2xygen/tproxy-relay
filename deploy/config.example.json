@@ -1,7 +1,7 @@
 {
   "public_hostname": "proxy.example.com",
   "listen": "0.0.0.0:8080",
-  "admin_listen": "0.0.0.0:8081",
+  "admin_listen": "127.0.0.1:8081",
   "carrier_mode": "https",
   "token_key_file": "/data/token.key",
   "limits": {
@@ -10,9 +10,9 @@
     "max_streams_per_session": 128,
     "max_backend_dials_in_flight": 256,
     "max_bootstraps_global": 512,
-    "max_pending_global_bytes": 536870912,
+    "max_pending_global_bytes": 268435456,
     "max_pending_global_items": 262144,
-    "max_pending_per_session": 33554432,
+    "max_pending_per_session": 16777216,
     "max_frame_payload": 1048576,
     "carrier_batch_bytes": 2097152,
     "new_sessions_per_minute": 600,

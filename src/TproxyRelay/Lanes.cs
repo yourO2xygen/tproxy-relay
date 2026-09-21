@@ -24,7 +24,7 @@ public sealed class LaneState(uint id)
     public bool LastBodyHashSet;
     public long AckedCursor;
     public long PendingCursor;
-    public byte[]? PendingBatch;
+    public PooledBatch? PendingBatch;
     public int PendingBatchFrames;
     public int UpInFlight;
     public CancellationTokenSource? ActivePoll;
@@ -33,10 +33,18 @@ public sealed class LaneState(uint id)
     public int QueuedItems;
     public volatile bool StreamClosed;
     public WebSocket? AttachedSocket;     // websocket-lanes: one socket per lane
+    private int _released;
 
-    /// <summary>Tombstone eviction path: release everything the lane still held.</summary>
+    /// <summary>
+    /// Tombstone-eviction and session-close path: release everything the lane
+    /// still held. Exactly-once (eviction can race CloseSession) and the
+    /// PendingBatch release happens under Sync — the GetDownLane ack path
+    /// clears it under the same lock (REL-018 double-release race).
+    /// </summary>
     public void ReleaseAll(Session session)
     {
+        if (Interlocked.Exchange(ref _released, 1) == 1)
+            return;
         Queue.Writer.TryComplete();
         while (Queue.Reader.TryRead(out var f))
         {
@@ -45,12 +53,16 @@ public sealed class LaneState(uint id)
             Interlocked.Decrement(ref QueuedItems);
             f.Return();
         }
-        if (PendingBatch != null)
+        lock (Sync)
         {
-            RelayHub.ReleaseCharge(session, PendingBatch.Length, PendingBatchFrames);
-            Interlocked.Add(ref QueuedCharge, -(PendingBatch.Length + RelayHub.ItemOverhead * PendingBatchFrames));
-            Interlocked.Add(ref QueuedItems, -PendingBatchFrames);
-            PendingBatch = null;
+            if (PendingBatch != null)
+            {
+                RelayHub.ReleaseCharge(session, PendingBatch.Length, PendingBatchFrames);
+                Interlocked.Add(ref QueuedCharge, -(PendingBatch.Length + RelayHub.ItemOverhead * PendingBatchFrames));
+                Interlocked.Add(ref QueuedItems, -PendingBatchFrames);
+                PendingBatch.Return();
+                PendingBatch = null;
+            }
         }
     }
 }
@@ -68,7 +80,7 @@ public sealed partial class RelayHub
 
     // ---- https-lanes uplink ---------------------------------------------------
 
-    public async Task<LaneUpResult> ApplyUpLane(Session session, uint laneId, int seq, byte[] body)
+    public async Task<LaneUpResult> ApplyUpLane(Session session, uint laneId, int seq, ReadOnlyMemory<byte> body)
     {
         if (session.Dead)
             return new LaneUpResult(LaneOutcome.Fatal, 0, "session closed");
@@ -89,7 +101,7 @@ public sealed partial class RelayHub
             {
                 if (seq == lane.LastSeq)
                 {
-                    if (lane.LastBodyHashSet && lane.LastBodyHash == Hash64(body))
+                    if (lane.LastBodyHashSet && lane.LastBodyHash == Hash64(body.Span))
                         return new LaneUpResult(LaneOutcome.Ok, seq); // byte-identical retry
                     return new LaneUpResult(LaneOutcome.Fatal, seq, "duplicate seq with different body");
                 }
@@ -132,7 +144,7 @@ public sealed partial class RelayHub
             lock (lane.Sync)
             {
                 lane.LastSeq = seq;
-                lane.LastBodyHash = Hash64(body);
+                lane.LastBodyHash = Hash64(body.Span);
                 lane.LastBodyHashSet = true;
             }
             FlushWindowGrants(session);
@@ -171,7 +183,7 @@ public sealed partial class RelayHub
         if (!session.Lanes.TryGetValue(laneId, out var lane))
             return new DownResult(null, cursor, false, true); // unknown/evicted lane
 
-        byte[]? replay;
+        PooledBatch? replay;
         lock (lane.Sync)
         {
             if (cursor != lane.AckedCursor && cursor != lane.PendingCursor)
@@ -187,6 +199,7 @@ public sealed partial class RelayHub
                 {
                     lane.AckedCursor = cursor;
                     ReleaseLaneCharge(session, lane, lane.PendingBatch.Length, lane.PendingBatchFrames);
+                    lane.PendingBatch.Return();
                     lane.PendingBatch = null;
                 }
             }
@@ -275,25 +288,35 @@ public sealed partial class RelayHub
             }
 
             var frameCount = frames.Count;
-            var body = new byte[bytes];
+            var batch = PooledBatch.Rent(bytes);
             var off = 0;
             foreach (var f in frames)
             {
-                f.Span.CopyTo(body.AsSpan(off));
+                f.Span.CopyTo(batch.Buffer.AsSpan(off));
                 off += f.Length;
             }
             ReturnFrames(frames);
             long newCursor;
             lock (lane.Sync)
             {
+                if (session.Dead)
+                {
+                    // Raced CloseSession (which releases the lane via
+                    // ReleaseAll): installing the batch now would leak its
+                    // charge with no acker left (REL-001).
+                    ReleaseLaneCharge(session, lane, batch.Length, frameCount);
+                    batch.Return();
+                    Counters.DownBatch(batch.Length);
+                    return DownResult.Empty(cursor);
+                }
                 lane.PendingCursor = lane.AckedCursor + 1;
-                lane.PendingBatch = body;
+                lane.PendingBatch = batch;
                 lane.PendingBatchFrames = frameCount;
                 newCursor = lane.PendingCursor;
             }
-            Counters.DownBatch(body.Length);
-            Interlocked.Add(ref session.DownBytesTotal, body.Length);
-            return DownResult.Batch(body, newCursor);
+            Counters.DownBatch(batch.Length);
+            Interlocked.Add(ref session.DownBytesTotal, batch.Length);
+            return DownResult.Batch(batch, newCursor);
         }
         catch (OperationCanceledException)
         {
@@ -303,6 +326,7 @@ public sealed partial class RelayHub
         {
             Interlocked.CompareExchange(ref lane.ActivePoll, null, myCancel);
             lane.Collect.Release();
+            myCancel.Dispose(); // REL-013: per-poll CTS must not leak
         }
     }
 
@@ -311,8 +335,15 @@ public sealed partial class RelayHub
     /// <summary>Runs one per-stream WebSocket lane (subprotocol tproxy-lane-v1).</summary>
     public async Task RunWebSocketLane(Session session, uint laneId, WebSocket ws, CancellationToken ct)
     {
+        // The socket IS this lane's carrier: in websocket-lanes there is no
+        // https OPEN beforehand, so the lane is born here (the endpoint has
+        // already rejected tombstoned ids).
         if (!session.Lanes.TryGetValue(laneId, out var lane))
-            return; // racing eviction
+        {
+            if (session.Dead)
+                return;
+            lane = session.Lanes.GetOrAdd(laneId, _ => new LaneState(laneId));
+        }
         lane.AttachedSocket = ws;
         var established = false;
         try
@@ -339,18 +370,25 @@ public sealed partial class RelayHub
                         continue;
                     }
                     var frameCount = frames.Count;
-                    var body = new byte[bytes];
+                    var batch = PooledBatch.Rent(bytes);
                     var off = 0;
                     foreach (var f in frames)
                     {
-                        f.Span.CopyTo(body.AsSpan(off));
+                        f.Span.CopyTo(batch.Buffer.AsSpan(off));
                         off += f.Length;
                     }
                     ReturnFrames(frames);
-                    ReleaseLaneCharge(session, lane, body.Length, frameCount);
-                    Counters.DownBatch(body.Length);
-                    Interlocked.Add(ref session.DownBytesTotal, body.Length);
-                    await ws.SendAsync(body, WebSocketMessageType.Binary, true, ct);
+                    ReleaseLaneCharge(session, lane, batch.Length, frameCount);
+                    Counters.DownBatch(batch.Length);
+                    Interlocked.Add(ref session.DownBytesTotal, batch.Length);
+                    try
+                    {
+                        await ws.SendAsync(batch.Payload, WebSocketMessageType.Binary, true, ct);
+                    }
+                    finally
+                    {
+                        batch.Return();
+                    }
                     session.Touch();
                     // Lane fully drained after its stream closed: the socket's
                     // job is done (the CLOSE frame has been delivered).
@@ -364,17 +402,19 @@ public sealed partial class RelayHub
             }, ct);
 
             var buf = new byte[64 * 1024];
+            // PERF-010: one receive buffer per lane socket, reset per message.
+            var recv = new MemoryStream(64 * 1024);
             while (!ct.IsCancellationRequested && ws.State == WebSocketState.Open)
             {
-                using var ms = new MemoryStream();
+                recv.SetLength(0);
                 WebSocketReceiveResult result;
                 do
                 {
                     result = await ws.ReceiveAsync(new ArraySegment<byte>(buf), ct);
                     if (result.MessageType != WebSocketMessageType.Binary)
                         goto laneFail; // text messages close the lane only
-                    ms.Write(buf, 0, result.Count);
-                    if (ms.Length > _opt.DownBatchTargetBytes)
+                    recv.Write(buf, 0, result.Count);
+                    if (recv.Length > _opt.DownBatchTargetBytes)
                         goto laneFail; // oversized message
                 }
                 while (!result.EndOfMessage);
@@ -382,7 +422,7 @@ public sealed partial class RelayHub
                 List<Frame> frames;
                 try
                 {
-                    frames = FrameCodec.ParseAll(ms.GetBuffer().AsMemory(0, (int)ms.Length), _opt.MaxFramePayload);
+                    frames = FrameCodec.ParseAll(recv.GetBuffer().AsMemory(0, (int)recv.Length), _opt.MaxFramePayload);
                 }
                 catch (FrameException)
                 {
@@ -412,8 +452,8 @@ public sealed partial class RelayHub
                     goto laneFail; // lane-scoped budget: close this stream only
                 }
                 FlushWindowGrants(session);
-                Counters.UpBatch((int)ms.Length);
-                Interlocked.Add(ref session.UpBytesTotal, ms.Length);
+                Counters.UpBatch((int)recv.Length);
+                Interlocked.Add(ref session.UpBytesTotal, recv.Length);
                 continue;
 
             laneFail:

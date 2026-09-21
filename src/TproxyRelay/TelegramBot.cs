@@ -67,6 +67,9 @@ public sealed class TelegramBot : BackgroundService
 
     // ---- transport ------------------------------------------------------------
 
+    /// <summary>retry_after from the last failed call (Bot API 429), seconds.</summary>
+    internal int LastRetryAfter;
+
     internal async Task<JsonElement?> Api(string method, object? payload = null, CancellationToken ct = default)
     {
         try
@@ -76,14 +79,19 @@ public sealed class TelegramBot : BackgroundService
                 : JsonContent.Create(payload);
             var resp = await _http.PostAsync(
                 $"https://api.telegram.org/bot{_cfg.Token}/{method}", content, ct);
-            var doc = await JsonDocument.ParseAsync(await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+            await using var stream = await resp.Content.ReadAsStreamAsync(ct);
+            using var doc = await JsonDocument.ParseAsync(stream, cancellationToken: ct);
             if (!doc.RootElement.GetProperty("ok").GetBoolean())
             {
-                _log.LogWarning("event=tg_api_failed method={Method} desc={Desc}",
-                    method, doc.RootElement.TryGetProperty("description", out var d) ? d.GetString() : "?");
+                LastRetryAfter = ParseRetryAfter(doc.RootElement);
+                _log.LogWarning("event=tg_api_failed method={Method} desc={Desc} retry_after={Retry}",
+                    method,
+                    doc.RootElement.TryGetProperty("description", out var d) ? d.GetString() : "?",
+                    LastRetryAfter);
                 return null;
             }
-            return doc.RootElement.GetProperty("result");
+            // Clone: the document is disposed, the element must outlive it.
+            return doc.RootElement.GetProperty("result").Clone();
         }
         catch (OperationCanceledException)
         {
@@ -97,6 +105,13 @@ public sealed class TelegramBot : BackgroundService
             return null;
         }
     }
+
+    internal static int ParseRetryAfter(JsonElement root) =>
+        root.TryGetProperty("parameters", out var p) &&
+        p.TryGetProperty("retry_after", out var ra) &&
+        ra.ValueKind == JsonValueKind.Number
+            ? ra.GetInt32()
+            : 0;
 
     internal async Task Poll(CancellationToken ct)
     {
@@ -124,32 +139,45 @@ public sealed class TelegramBot : BackgroundService
             foreach (var u in updates.Value.EnumerateArray())
             {
                 _offset = u.GetProperty("update_id").GetInt64();
-                if (!u.TryGetProperty("message", out var msg))
-                    continue;
-                var chat = msg.GetProperty("chat").GetProperty("id").GetInt64();
-                if (!_cfg.AdminChats.Contains(chat.ToString()))
-                {
-                    // Visible in the logs so an operator can bootstrap their own
-                    // chat id into management.bot.admin_chat_ids.
-                    _log.LogInformation("event=tg_stranger chat={ChatId}", chat);
-                    continue;
-                }
-                if (!msg.TryGetProperty("text", out var textEl))
-                    continue;
-                var text = textEl.GetString() ?? "";
-                _log.LogInformation("event=tg_command chat={ChatId} text={Text}", chat, text);
-                string reply;
+                // REL-003: a single malformed update (or a failing send) must
+                // never take the whole command channel down.
                 try
                 {
-                    reply = await HandleCommandAsync(text);
+                    if (!u.TryGetProperty("message", out var msg))
+                        continue;
+                    if (!msg.TryGetProperty("chat", out var chatEl) ||
+                        !chatEl.TryGetProperty("id", out var chatIdEl))
+                        continue;
+                    var chat = chatIdEl.GetInt64();
+                    if (!_cfg.AdminChats.Contains(chat.ToString()))
+                    {
+                        // Visible in the logs so an operator can bootstrap their own
+                        // chat id into management.bot.admin_chat_ids.
+                        _log.LogInformation("event=tg_stranger chat={ChatId}", chat);
+                        continue;
+                    }
+                    if (!msg.TryGetProperty("text", out var textEl))
+                        continue;
+                    var text = textEl.GetString() ?? "";
+                    _log.LogInformation("event=tg_command chat={ChatId} text={Text}", chat, text);
+                    string reply;
+                    try
+                    {
+                        reply = await HandleCommandAsync(text);
+                    }
+                    catch (Exception e)
+                    {
+                        _log.LogError("event=tg_command_failed text={Text} err={Error}", text, e.Message);
+                        reply = $"ошибка: {e.Message}";
+                    }
+                    if (reply.Length > 0)
+                        await Send(chat, reply, ct);
                 }
+                catch (OperationCanceledException) { throw; }
                 catch (Exception e)
                 {
-                    _log.LogError("event=tg_command_failed text={Text} err={Error}", text, e.Message);
-                    reply = $"ошибка: {e.Message}";
+                    _log.LogError("event=tg_update_failed err={Error}", e.Message);
                 }
-                if (reply.Length > 0)
-                    await Send(chat, reply, ct);
             }
         }
         _log.LogInformation("event=tg_bot_stopped");
@@ -159,8 +187,21 @@ public sealed class TelegramBot : BackgroundService
     {
         // Telegram hard-caps messages at 4096 characters.
         for (var off = 0; off < text.Length; off += 4000)
-            await Api("sendMessage",
-                new { chat_id = chat, text = text[off..Math.Min(text.Length, off + 4000)] }, ct);
+        {
+            // REL-008: on 429 honor the server-provided retry_after (once)
+            // instead of dropping the chunk on the floor.
+            for (var attempt = 0; ; attempt++)
+            {
+                LastRetryAfter = 0;
+                if (await Api("sendMessage",
+                        new { chat_id = chat, text = text[off..Math.Min(text.Length, off + 4000)] }, ct) != null)
+                    break;
+                if (attempt >= 1 || LastRetryAfter <= 0)
+                    break;
+                try { await Task.Delay(TimeSpan.FromSeconds(Math.Min(LastRetryAfter, 30)), ct); }
+                catch (OperationCanceledException) { return; }
+            }
+        }
     }
 
     // ---- commands ---------------------------------------------------------------
@@ -205,21 +246,15 @@ public sealed class TelegramBot : BackgroundService
 
     private string Stats()
     {
-        var gauge = (string name) =>
-        {
-            foreach (var l in Counters.Render().Split('\n'))
-                if (l.StartsWith(name + ' '))
-                    return l[(name.Length + 1)..].Trim();
-            return "0";
-        };
+        var s = Counters.Snapshot();
         var sessions = _hub.SessionsSnapshot();
         var sb = new StringBuilder();
         sb.AppendLine("Состояние релея:");
-        sb.AppendLine($"Сессий: {gauge("tproxy_sessions_active")} | Стримов: {gauge("tproxy_streams_active")}");
-        sb.AppendLine($"Трафик всего: ↑{Fmt(long.Parse(gauge("tproxy_up_bytes_total")))} ↓{Fmt(long.Parse(gauge("tproxy_down_bytes_total")))}");
-        sb.AppendLine($"Лимитов задето: {gauge("tproxy_limit_hits_total")} | Активных ключей: {_registry.All.Count}");
-        foreach (var s in sessions.Take(10))
-            sb.AppendLine($"  • {s.KeyId}: стримов {s.Streams}, активность {s.LastActivity:HH:mm:ss}");
+        sb.AppendLine($"Сессий: {s.SessionsActive} | Стримов: {s.StreamsActive}");
+        sb.AppendLine($"Трафик всего: ↑{Fmt(s.UpBytes)} ↓{Fmt(s.DownBytes)}");
+        sb.AppendLine($"Лимитов задето: {s.LimitHits} | Активных ключей: {_registry.All.Count}");
+        foreach (var sess in sessions.Take(10))
+            sb.AppendLine($"  • {sess.KeyId}: стримов {sess.Streams}, активность {sess.LastActivity:HH:mm:ss}");
         return sb.ToString();
     }
 
@@ -261,27 +296,18 @@ public sealed class TelegramBot : BackgroundService
         var key = _store.GetByName(name);
         if (key == null || key.RevokedUtc != null)
             return $"Ключ «{name}» не найден.";
-        var closed = 0;
-        switch (action)
-        {
-            case "revoke":
-                _store.Revoke(key.Id);
-                closed = _hub.CloseAllSessionsForKey(key.Id, "key revoked");
-                break;
-            case "pause":
-                _store.SetPaused(key.Id, true);
-                closed = _hub.CloseAllSessionsForKey(key.Id, "key paused");
-                break;
-            case "resume":
-                _store.SetPaused(key.Id, false);
-                break;
-        }
-        AdminApi.RefreshAndExport(_opt, _store, _registry);
+        // The revoke/pause/resume ritual is owned by KeyManager (ARCH-004).
         return action switch
         {
-            "revoke" => $"Ключ «{name}» отозван, сессий закрыто: {closed}.",
-            "pause" => $"Ключ «{name}» на паузе, сессий закрыто: {closed}.",
-            _ => $"Ключ «{name}» снова активен.",
+            "revoke" => KeyManager.Revoke(_opt, _store, _registry, _hub, key.Id) is var closedR && closedR >= 0
+                ? $"Ключ «{name}» отозван, сессий закрыто: {closedR}."
+                : $"Ключ «{name}» не найден.",
+            "pause" => KeyManager.Pause(_opt, _store, _registry, _hub, key.Id) is var closedP && closedP >= 0
+                ? $"Ключ «{name}» на паузе, сессий закрыто: {closedP}."
+                : $"Ключ «{name}» не найден.",
+            _ => KeyManager.Resume(_opt, _store, _registry, key.Id)
+                ? $"Ключ «{name}» снова активен."
+                : $"Ключ «{name}» не найден.",
         };
     }
 

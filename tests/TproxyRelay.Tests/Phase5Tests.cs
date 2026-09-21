@@ -64,13 +64,13 @@ public class Phase5LanesTests : IAsyncLifetime
         for (var i = 0; i < 20; i++)
         {
             down = await _hub.GetDownLane(session, 5, cursor, cts.Token);
-            if (down.HasBatch && FrameCodec.ParseAll(down.Body!).Any(f => f.Type == FrameType.Data))
+            if (down.HasBatch && FrameCodec.ParseAll(down.Body!.Payload).Any(f => f.Type == FrameType.Data))
                 break;
             if (down.HasBatch)
                 cursor = down.Cursor; // acknowledging happens on the next poll
         }
         Assert.True(down.HasBatch);
-        var frames = FrameCodec.ParseAll(down.Body!);
+        var frames = FrameCodec.ParseAll(down.Body!.Payload);
         Assert.All(frames, f => Assert.Equal(5u, f.StreamId));
         Assert.Contains(frames, f => f.Type == FrameType.Window);
         Assert.Contains(frames, f => f.Type == FrameType.Data);

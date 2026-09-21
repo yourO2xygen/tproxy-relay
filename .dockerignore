@@ -2,3 +2,12 @@
 **/obj/
 **/.vs/
 .git/
+# CFG-002: секреты и локальные артефакты не должны попадать в build context.
+.env
+.env.*
+*.local
+token.key
+keys.db
+*.db
+registry.txt
+.audit/

@@ -107,6 +107,29 @@ deploy/production/setup.sh proxy.yourdomain.tld --show --base-path myslug
 Бот выдаёт ключ вместе с готовой `t.me`-ссылкой (учитывает base path и
 маркированный секрет).
 
+#### Bootstrap chat-id бота
+
+Ваш chat-id боту нужно сообщить один раз: напишите боту любое сообщение и
+найдите в логах релея строку `event=tg_stranger chat=<id>` — этот `<id>`
+подставьте в `TPROXY_BOT_ADMINS` и пересоздайте релей. Пока id не прописан,
+бот читает сообщения, но отвечает только незнакомцам в лог (канал не
+компрометируется). Подробности команд — по `/help` в самом боте.
+
+#### Admin API — справочник
+
+Базовый префикс `/admin` на админ-порте (loopback), `Authorization: Bearer
+<TPROXY_API_TOKEN>`. Нет/неверный токен → 404 (без оракула).
+
+| Путь | Ответ |
+|---|---|
+| `GET /admin/stats` | `{sessions_active, streams_active, bootstraps_outstanding, up_bytes_total, down_bytes_total, limit_hits_total, pending_bytes, keys[]}` |
+| `GET /admin/keys[?reveal=1]` | список ключей; секрет — только при `reveal=1` (любое другое значение скрывает) |
+| `POST /admin/keys` | `{"name":"...", "secret_hex?":"..."}` → 201 с секретом и t.me-ссылкой; 400 (битый JSON/тип/имя), 409 (дубль) |
+| `DELETE /admin/keys/{id}` | 200 `{revoked, sessions_closed}`; 404 если нет/уже отозван |
+| `POST /admin/keys/{id}/pause` · `/resume` | 200; пауза закрывает сессии ключа |
+| `GET /admin/sessions` | живые сессии (без токенов) |
+| `GET /admin/traffic?days=N` | агрегаты трафика по ключам за N дней (1–90) |
+
 ### Ops
 
 - Статистика MTProxy (встроенный порт): `docker exec tproxy-mtproxy curl -s 127.0.0.1:8888/stats`
@@ -115,7 +138,57 @@ deploy/production/setup.sh proxy.yourdomain.tld --show --base-path myslug
   ежедневно; прокси перезапускается только если данные изменились
 - Обновление релея: `git pull && docker compose -f docker-compose.prod.yml up -d --build relay`
   (сессии инвалидируются, клиенты переподключаются автоматически); откат —
-  `git checkout v1.0.0` и та же команда
+  на предыдущий git-тег и та же команда
+
+#### Runbook
+
+**Где логи.** `docker logs tproxy-relay` (ротация 3×10 МиБ), журнал детей
+mtproxy — `/tmp/mtproxy/log-<порт>` внутри контейнера mtproxy.
+
+**Бэкап keys.db.** Реестр ключей — единственное состояние:
+`docker exec tproxy-relay sh -c 'sqlite3 /data/keys.db ".backup /tmp/keys.db"'`
+(в образе нет sqlite3 — используйте `docker cp` после краткого `compose stop
+relay`, либо `cp` прямо на volume: WAL-режим держит консистентность при
+чтении). Восстановление: остановить relay, вернуть файл, стартовать.
+
+**Ротация секрета builtin-профиля.** Поменять `TPROXY_SECRET_HEX` →
+`up -d relay mtproxy`; все клиенты builtin-ключа переподключаются по новой
+ссылке. Управляемые ключи ротируются через `/revoke` + `/key`.
+
+**Симптом → действие:**
+
+| Симптом | Причина / действие |
+|---|---|
+| Новые сессии сразу закрываются, `tproxy_limit_hits_total` растёт | исчерпан pending-бюджет утечкой (до v1.2.0) или реальный штурм: смотрите `tproxy_pending_bytes` — при монотонном росте без спада рестарт relay (временная мера до v1.2.0) |
+| Контейнер релея OOMKilled | не должно случаться с v1.2.0 (GC-лимит); проверьте, что не подняли pending-бюджеты выше ~25% mem_limit |
+| mtproxy `unhealthy` | дети мертвы и не респавнятся — `docker logs tproxy-mtproxy`, логи на `/tmp/mtproxy/log-*` |
+| Бот молчит | упал polling: `docker logs tproxy-relay \| grep tg_`; `tg_api_timeout` — норма (долгий полл) |
+| Вечный 503 на `/api/v1/*` | бэкенд недоступен: `/readyz` на админ-порте покажет `backend unreachable` |
+| Забыли админ-токен API | `TPROXY_API_TOKEN` в `.env` на сервере; смените и `up -d relay` |
+
+**Алерты (минимум).** По Prometheus: `tproxy_pending_bytes > 200 МиБ`
+(подход к бюджету), `tproxy_limit_hits_total` растёт быстрее ~10/мин,
+`up == 0` (healthcheck), память контейнера > 60% лимита.
+
+### Разработка (dev-флоу)
+
+```bash
+dotnet test tests/TproxyRelay.Tests            # 130 юнит+интеграционных
+dotnet run --project tools/TproxyTestClient    # e2e против локального стека
+docker compose up -d --build                   # стек: nginx+relay+echo-stub
+docker compose -f docker-compose.yml -f docker-compose.ws.yml up -d --build
+                                               # то же в websocket-режиме
+```
+
+- Локальный https-стек слушает `:80/:443` (самоподписанный CA — см. скрипты
+  `deploy/`), админ — `127.0.0.1:8081`.
+- `docker-compose.ws.yml` — overlay, переключающий релей в websocket-режим.
+- Тестовый клиент умеет полный https-флоу (28 проверок) и websocket (23);
+  echo-ассерты против реального MTProxy ожидаемо падают (бэкенд не эхо).
+- Интеграционные тесты поднимают настоящий релей на свободных портах
+  (`tests/TproxyRelay.Tests/Integration/`) — окружение им не нужно.
+- Конфиг-слои: env → `config.json` → дефолты; полный справочник env —
+  `.env.example`, пример config.json — `deploy/config.example.json`.
 
 ### 3. Контейнеры
 
@@ -185,7 +258,7 @@ MTProxy за docker-NAT обязан представляться middle-end'у 
 публичный приходит из `.env` (`MTPROXY_PUBLIC_IP`). Симптом пропущенного NAT:
 без ошибок в логах стримы доходят до WINDOW и зависают. Если подсеть
 `172.20.0.0/24` на сервере занята — поменяйте её в compose и `MTPROXY_LOCAL_IP`.
-## Что реализовано (по PROTOCOL.md)
+## Что реализовано (по [PROTOCOL.md](docs/PROTOCOL.md); также [BASE_PATH.md](docs/BASE_PATH.md) и [PUBLIC_SITE.md](docs/PUBLIC_SITE.md))
 
 - Вывод bridge capability: `HMAC-SHA256(secret, "tdesktop-web-proxy-bridge-v1\n"+host)`,
   включая оба нормативных тестовых вектора.
@@ -205,9 +278,20 @@ MTProxy за docker-NAT обязан представляться middle-end'у 
   `tproxy_limit_hits_total`.
 - Юнит-тесты: `dotnet test tests/TproxyRelay.Tests`; CI: build + test + docker build.
 
-## Упрощения относительно референса
+## Отличия от референса
 
-- Один профиль/секрет (не список), режимы https-lanes/websocket-lanes не реализованы.
-- Токены хранятся в памяти как есть (не хэш), нет per-IP лимитов и rate buckets.
-- WINDOW не коалесцируются; pending-бюджет грубый (только по client DATA).
-- X-Forwarded-For не обрабатывается (per-IP лимиты выключены, как в референсе по умолчанию).
+Паритет с tproxy-server достигнут по функциональности (фазы 4–10); перечислены
+сознательные отличия реализации, а не отсутствующие функции.
+
+- Носители: все четыре режима (`https`, `websocket`, `https-lanes`,
+  `websocket-lanes`) с lane-scoped seq/cursor/replay; ключи — полноценный
+  реестр в SQLite (создание/отзыв/пауза/трафик) вместо одного секрета.
+- Токены хранятся в памяти как есть (не хэш) — как в референсе; секрет в
+  token.key в volume.
+- WINDOW коалесцируются (GrantPending); pending-бюджет трёхуровневый:
+  per-session + global (байты и элементы) + per-lane в lanes-режимах.
+- X-Forwarded-For принимается строго одним значением (список → 400); при
+  выключенных per-IP лимитах — как в референсе по умолчанию.
+- Поверх референса: base-path деплой (v2-capability, слаг, маркированные
+  ссылки t.me), public_dir/public_upstream сайты, Admin API (loopback,
+  fail-closed) и Telegram-бот управления ключами.
