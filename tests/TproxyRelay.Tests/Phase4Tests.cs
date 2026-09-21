@@ -17,13 +17,16 @@ public class RateBucketTests
     }
 
     [Fact]
-    public async Task Refills_Over_Time()
+    public void Refills_Over_Time()
     {
-        var b = new RateBucket(6000, 1); // 100/sec
+        // TEST-008: a virtual clock instead of a real Task.Delay(120).
+        var t = 0L; // ms
+        var b = new RateBucket(6000, 1, () => t * TimeSpan.TicksPerMillisecond);
         Assert.True(b.TryTake());
         Assert.False(b.TryTake());
-        await Task.Delay(120);
+        t += 20; // 20ms at 100/sec refills 2 tokens, capped at burst 1
         Assert.True(b.TryTake());
+        Assert.False(b.TryTake());
     }
 
     [Fact]

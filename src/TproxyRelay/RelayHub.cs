@@ -59,7 +59,7 @@ public sealed class Session
     private int _dead;
     public bool Dead => Volatile.Read(ref _dead) == 1;
 
-    public bool LanesMode => CarrierMode is "https-lanes" or "websocket-lanes";
+    public bool LanesMode => CarrierModes.IsLanes(CarrierMode);
 
     public Session()
     {

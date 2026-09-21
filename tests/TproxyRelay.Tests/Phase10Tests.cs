@@ -76,6 +76,8 @@ public sealed class TelegramBotTests : IDisposable
 
     public void Dispose()
     {
-        try { File.Delete(_db); } catch { }
+        // TEST-010: clean every SQLite sidecar, not just the main db file.
+        foreach (var suffix in new[] { "", "-journal", "-wal", "-shm" })
+            try { File.Delete(_db + suffix); } catch { /* best effort */ }
     }
 }

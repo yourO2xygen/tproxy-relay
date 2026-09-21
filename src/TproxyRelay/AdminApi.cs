@@ -41,17 +41,18 @@ public static class AdminApi
         app.Map(prefixBase + "/stats", async (HttpContext ctx) =>
         {
             if (!Auth(ctx)) { ctx.Response.StatusCode = 404; return; }
+            var s = Counters.Snapshot();
             ctx.Response.StatusCode = 200;
             ctx.Response.ContentType = "application/json";
             await ctx.Response.WriteAsync(System.Text.Json.JsonSerializer.Serialize(new
             {
-                sessions_active = CountersRender("tproxy_sessions_active"),
-                streams_active = CountersRender("tproxy_streams_active"),
+                sessions_active = s.SessionsActive,
+                streams_active = s.StreamsActive,
                 bootstraps_outstanding = hub.BootstrapCount,
-                up_bytes_total = CountersRender("tproxy_up_bytes_total"),
-                down_bytes_total = CountersRender("tproxy_down_bytes_total"),
-                limit_hits_total = CountersRender("tproxy_limit_hits_total"),
-                pending_bytes = CountersRender("tproxy_pending_bytes"),
+                up_bytes_total = s.UpBytes,
+                down_bytes_total = s.DownBytes,
+                limit_hits_total = s.LimitHits,
+                pending_bytes = s.PendingBytes,
                 keys = registry.All.Select(p => new { p.KeyId, p.Name, p.Backend }),
             }, JsonOpts));
         });
@@ -77,14 +78,26 @@ public static class AdminApi
         app.MapPost(prefixBase + "/keys", async (HttpContext ctx) =>
         {
             if (!Auth(ctx)) { ctx.Response.StatusCode = 404; return; }
-            using var doc = await System.Text.Json.JsonDocument.ParseAsync(ctx.Request.Body, cancellationToken: ctx.RequestAborted);
-            var name = doc.RootElement.TryGetProperty("name", out var n) ? n.GetString() : null;
-            var secret = doc.RootElement.TryGetProperty("secret_hex", out var s) ? s.GetString() : null;
+            // REL-015/API-007: broken JSON and wrong-typed fields are client
+            // errors (400), never bare 500s leaking .NET internals.
+            string? name, secret;
+            try
+            {
+                using var doc = await System.Text.Json.JsonDocument.ParseAsync(
+                    ctx.Request.Body, cancellationToken: ctx.RequestAborted);
+                name = GetStringProp(doc.RootElement, "name");
+                secret = GetStringProp(doc.RootElement, "secret_hex");
+            }
+            catch (System.Text.Json.JsonException)
+            {
+                await Error(ctx, 400, "malformed JSON body");
+                return;
+            }
             try
             {
                 var key = store.Create(name ?? throw new ArgumentException("name is required"),
                     string.IsNullOrWhiteSpace(secret) ? null : secret);
-                RefreshAndExport(opt, store, registry);
+                KeyManager.RefreshAndExport(opt, store, registry);
                 ctx.Response.StatusCode = 201;
                 ctx.Response.ContentType = "application/json";
                 await ctx.Response.WriteAsync(System.Text.Json.JsonSerializer.Serialize(KeyView(key, opt, reveal: true), JsonOpts));
@@ -102,25 +115,26 @@ public static class AdminApi
         app.MapDelete(prefixBase + "/keys/{id}", async (HttpContext ctx, string id) =>
         {
             if (!Auth(ctx)) { ctx.Response.StatusCode = 404; return; }
-            var key = store.Get(id);
-            if (key == null || !store.Revoke(id))
+            var closed = KeyManager.Revoke(opt, store, registry, hub, id);
+            if (closed < 0)
             {
                 await Error(ctx, 404, "no such active key");
                 return;
             }
-            RefreshAndExport(opt, store, registry);
-            var closed = hub.CloseAllSessionsForKey(id, "key revoked");
             ctx.Response.StatusCode = 200;
             ctx.Response.ContentType = "application/json";
-            await ctx.Response.WriteAsync(System.Text.Json.JsonSerializer.Serialize(new { revoked = key.Id, sessions_closed = closed }, JsonOpts));
+            await ctx.Response.WriteAsync(System.Text.Json.JsonSerializer.Serialize(new { revoked = id, sessions_closed = closed }, JsonOpts));
         });
 
         app.MapPost(prefixBase + "/keys/{id}/pause", async (HttpContext ctx, string id) =>
         {
             if (!Auth(ctx)) { ctx.Response.StatusCode = 404; return; }
-            if (!store.SetPaused(id, true)) { await Error(ctx, 404, "no such active key"); return; }
-            RefreshAndExport(opt, store, registry);
-            var closed = hub.CloseAllSessionsForKey(id, "key paused");
+            var closed = KeyManager.Pause(opt, store, registry, hub, id);
+            if (closed < 0)
+            {
+                await Error(ctx, 404, "no such active key");
+                return;
+            }
             ctx.Response.StatusCode = 200;
             ctx.Response.ContentType = "application/json";
             await ctx.Response.WriteAsync(System.Text.Json.JsonSerializer.Serialize(new { paused = id, sessions_closed = closed }, JsonOpts));
@@ -129,8 +143,7 @@ public static class AdminApi
         app.MapPost(prefixBase + "/keys/{id}/resume", async (HttpContext ctx, string id) =>
         {
             if (!Auth(ctx)) { ctx.Response.StatusCode = 404; return; }
-            if (!store.SetPaused(id, false)) { await Error(ctx, 404, "no such active key"); return; }
-            RefreshAndExport(opt, store, registry);
+            if (!KeyManager.Resume(opt, store, registry, id)) { await Error(ctx, 404, "no such active key"); return; }
             ctx.Response.StatusCode = 200;
             ctx.Response.ContentType = "application/json";
             await ctx.Response.WriteAsync("{\"resumed\":true}");
@@ -168,14 +181,15 @@ public static class AdminApi
         });
     }
 
-    /// <summary>Reloads managed profiles and re-exports the supervisor registry.</summary>
-    public static void RefreshAndExport(RelayOptions opt, KeyStore store, ProfileRegistry registry)
-    {
-        registry.ReplaceManaged(store.ListKeys(includeRevoked: false).Where(k => k.Active).Select(k =>
-            new RelayProfile(k.Id, k.Name, Convert.FromHexString(k.SecretHex),
-                opt.BackendHostName, k.BackendPort, opt.CarrierMode)));
-        store.ExportRegistry(Convert.ToHexString(opt.Secret).ToLowerInvariant());
-    }
+    /// <summary>Legacy forwarder: the ritual lives in KeyManager now.</summary>
+    public static void RefreshAndExport(RelayOptions opt, KeyStore store, ProfileRegistry registry) =>
+        KeyManager.RefreshAndExport(opt, store, registry);
+
+    /// <summary>Strictly a JSON string property, or null (wrong kind included).</summary>
+    private static string? GetStringProp(System.Text.Json.JsonElement el, string name) =>
+        el.TryGetProperty(name, out var v) && v.ValueKind == System.Text.Json.JsonValueKind.String
+            ? v.GetString()
+            : null;
 
     private static object KeyView(KeyRecord k, RelayOptions opt, bool reveal) => new
     {
@@ -190,15 +204,6 @@ public static class AdminApi
         // Client-facing credits: the capability depends on hostname+base path.
         link = ProxyLinks.Tme(opt.PublicHostname, opt.BasePath, Convert.FromHexString(k.SecretHex)),
     };
-
-    private static long CountersRender(string name)
-    {
-        var text = Counters.Render();
-        foreach (var line in text.Split('\n'))
-            if (line.StartsWith(name + ' '))
-                return long.Parse(line[(name.Length + 1)..].Trim());
-        return 0;
-    }
 
     private static async Task Error(HttpContext ctx, int status, string message)
     {

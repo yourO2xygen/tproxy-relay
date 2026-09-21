@@ -246,21 +246,15 @@ public sealed class TelegramBot : BackgroundService
 
     private string Stats()
     {
-        var gauge = (string name) =>
-        {
-            foreach (var l in Counters.Render().Split('\n'))
-                if (l.StartsWith(name + ' '))
-                    return l[(name.Length + 1)..].Trim();
-            return "0";
-        };
+        var s = Counters.Snapshot();
         var sessions = _hub.SessionsSnapshot();
         var sb = new StringBuilder();
         sb.AppendLine("Состояние релея:");
-        sb.AppendLine($"Сессий: {gauge("tproxy_sessions_active")} | Стримов: {gauge("tproxy_streams_active")}");
-        sb.AppendLine($"Трафик всего: ↑{Fmt(long.Parse(gauge("tproxy_up_bytes_total")))} ↓{Fmt(long.Parse(gauge("tproxy_down_bytes_total")))}");
-        sb.AppendLine($"Лимитов задето: {gauge("tproxy_limit_hits_total")} | Активных ключей: {_registry.All.Count}");
-        foreach (var s in sessions.Take(10))
-            sb.AppendLine($"  • {s.KeyId}: стримов {s.Streams}, активность {s.LastActivity:HH:mm:ss}");
+        sb.AppendLine($"Сессий: {s.SessionsActive} | Стримов: {s.StreamsActive}");
+        sb.AppendLine($"Трафик всего: ↑{Fmt(s.UpBytes)} ↓{Fmt(s.DownBytes)}");
+        sb.AppendLine($"Лимитов задето: {s.LimitHits} | Активных ключей: {_registry.All.Count}");
+        foreach (var sess in sessions.Take(10))
+            sb.AppendLine($"  • {sess.KeyId}: стримов {sess.Streams}, активность {sess.LastActivity:HH:mm:ss}");
         return sb.ToString();
     }
 
@@ -302,27 +296,18 @@ public sealed class TelegramBot : BackgroundService
         var key = _store.GetByName(name);
         if (key == null || key.RevokedUtc != null)
             return $"Ключ «{name}» не найден.";
-        var closed = 0;
-        switch (action)
-        {
-            case "revoke":
-                _store.Revoke(key.Id);
-                closed = _hub.CloseAllSessionsForKey(key.Id, "key revoked");
-                break;
-            case "pause":
-                _store.SetPaused(key.Id, true);
-                closed = _hub.CloseAllSessionsForKey(key.Id, "key paused");
-                break;
-            case "resume":
-                _store.SetPaused(key.Id, false);
-                break;
-        }
-        AdminApi.RefreshAndExport(_opt, _store, _registry);
+        // The revoke/pause/resume ritual is owned by KeyManager (ARCH-004).
         return action switch
         {
-            "revoke" => $"Ключ «{name}» отозван, сессий закрыто: {closed}.",
-            "pause" => $"Ключ «{name}» на паузе, сессий закрыто: {closed}.",
-            _ => $"Ключ «{name}» снова активен.",
+            "revoke" => KeyManager.Revoke(_opt, _store, _registry, _hub, key.Id) is var closedR && closedR >= 0
+                ? $"Ключ «{name}» отозван, сессий закрыто: {closedR}."
+                : $"Ключ «{name}» не найден.",
+            "pause" => KeyManager.Pause(_opt, _store, _registry, _hub, key.Id) is var closedP && closedP >= 0
+                ? $"Ключ «{name}» на паузе, сессий закрыто: {closedP}."
+                : $"Ключ «{name}» не найден.",
+            _ => KeyManager.Resume(_opt, _store, _registry, key.Id)
+                ? $"Ключ «{name}» снова активен."
+                : $"Ключ «{name}» не найден.",
         };
     }
 

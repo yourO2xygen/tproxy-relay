@@ -332,8 +332,15 @@ public sealed partial class RelayHub
     /// <summary>Runs one per-stream WebSocket lane (subprotocol tproxy-lane-v1).</summary>
     public async Task RunWebSocketLane(Session session, uint laneId, WebSocket ws, CancellationToken ct)
     {
+        // The socket IS this lane's carrier: in websocket-lanes there is no
+        // https OPEN beforehand, so the lane is born here (the endpoint has
+        // already rejected tombstoned ids).
         if (!session.Lanes.TryGetValue(laneId, out var lane))
-            return; // racing eviction
+        {
+            if (session.Dead)
+                return;
+            lane = session.Lanes.GetOrAdd(laneId, _ => new LaneState(laneId));
+        }
         lane.AttachedSocket = ws;
         var established = false;
         try

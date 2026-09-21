@@ -213,7 +213,7 @@ public sealed class RelayOptions
         if (!BasePaths.IsValid(BasePath))
             throw new InvalidOperationException(
                 "base_path must be one or more '/'-separated segments of [A-Za-z0-9][A-Za-z0-9_-]*, at most 128 characters");
-        if (CarrierMode is not ("https" or "websocket" or "https-lanes" or "websocket-lanes"))
+        if (!CarrierModes.TryParse(CarrierMode, out _))
             throw new InvalidOperationException($"unsupported carrier mode {CarrierMode}");
         // 2 MiB is the desktop client's loopback-fallback message cap.
         if (DownBatchTargetBytes is < 4096 or > 2 * 1024 * 1024)
