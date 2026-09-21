@@ -54,5 +54,5 @@ jobs:
       - name: Docker image builds (all)
         run: |
           docker build -t tproxy-relay:ci -f deploy/relay/Dockerfile .
-          docker build -t tproxy-nginx:ci -f deploy/nginx/Dockerfile .
-          docker build -t tproxy-mtproxy:ci -f deploy/mtproxy/Dockerfile deploy/mtproxy
+          docker build -t tproxy-nginx:ci deploy/nginx
+          docker build -t tproxy-mtproxy:ci deploy/mtproxy
