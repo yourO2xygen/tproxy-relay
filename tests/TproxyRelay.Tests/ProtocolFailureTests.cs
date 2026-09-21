@@ -107,7 +107,7 @@ public sealed class ProtocolFailureTests : IAsyncLifetime
         using var cts = new CancellationTokenSource(2000);
         var down = await hub.GetDown(s, 0, cts.Token);
         Assert.True(down.HasBatch);
-        var frames = FrameCodec.ParseAll(down.Body!);
+        var frames = FrameCodec.ParseAll(down.Body!.Payload);
         Assert.Contains(frames, f => f.Type == FrameType.Close && f.StreamId == 7);
     }
 

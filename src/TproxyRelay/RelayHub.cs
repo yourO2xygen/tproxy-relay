@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Net;
@@ -7,6 +8,26 @@ using System.IO.Hashing;
 using System.Threading.Channels;
 
 namespace TproxyRelay;
+
+/// <summary>
+/// PERF-001: batch assembly buffer rented from the ArrayPool — the payload
+/// length is tracked separately from the rented capacity, so 2 MiB downlink
+/// batches never land on the Large Object Heap.
+/// </summary>
+public sealed class PooledBatch
+{
+    public byte[] Buffer = null!;
+    public int Length;
+
+    public static PooledBatch Rent(int length) => new()
+    {
+        Buffer = ArrayPool<byte>.Shared.Rent(length),
+        Length = length,
+    };
+
+    public Memory<byte> Payload => Buffer.AsMemory(0, Length);
+    public void Return() => ArrayPool<byte>.Shared.Return(Buffer);
+}
 
 public sealed class StreamState(uint id)
 {
@@ -21,8 +42,11 @@ public sealed class StreamState(uint id)
     public readonly TaskCompletionSource Connected = new(TaskCreationOptions.RunContinuationsAsynchronously);
     public Task? Pump;
     private int _closed;
+    private int _grantQueued;                          // PERF-005: present in session.GrantQueue
     public bool Closed => Volatile.Read(ref _closed) == 1;
     public bool MarkClosed() => Interlocked.Exchange(ref _closed, 1) == 0;
+    public bool MarkGrantQueued() => Interlocked.Exchange(ref _grantQueued, 1) == 0;
+    public void ClearGrantQueued() => Volatile.Write(ref _grantQueued, 0);
 }
 
 public sealed class Session
@@ -46,13 +70,14 @@ public sealed class Session
     public bool LastBodyHashSet;
     public long AckedCursor;
     public long PendingCursor;
-    public byte[]? PendingBatch;
+    public PooledBatch? PendingBatch;
     public int PendingBatchFrames;
     public long PendingBytes;                          // charged bytes incl. per-item overhead
     public int PendingItems;
     public int UpInFlight;
     public CancellationTokenSource? ActivePoll;
     public readonly SemaphoreSlim DownCollect = new(1, 1);
+    public readonly ConcurrentQueue<uint> GrantQueue = new(); // PERF-005: streams with unflushed WINDOW credit
     private readonly HashSet<uint> _tombstones = [];
     private readonly Queue<uint> _tombstoneOrder = new();
     private long _lastActivityTicks = DateTime.UtcNow.Ticks;
@@ -112,9 +137,9 @@ public enum UpOutcome { Acked, DuplicateAcked, RetryLater, Fatal }
 
 public sealed record UpResult(UpOutcome Outcome, int AckSeq, string? Error = null);
 
-public sealed record DownResult(byte[]? Body, long Cursor, bool HasBatch, bool ProtocolError, bool LaneClosed = false)
+public sealed record DownResult(PooledBatch? Body, long Cursor, bool HasBatch, bool ProtocolError, bool LaneClosed = false)
 {
-    public static DownResult Batch(byte[] body, long cursor) => new(body, cursor, true, false);
+    public static DownResult Batch(PooledBatch body, long cursor) => new(body, cursor, true, false);
     public static DownResult Empty(long cursor) => new(null, cursor, false, false);
     public static DownResult LaneComplete(long cursor) => new(null, cursor, false, false, true);
 }
@@ -302,6 +327,7 @@ public sealed partial class RelayHub
             if (session.PendingBatch != null)
             {
                 ReleaseCharge(session, session.PendingBatch.Length, session.PendingBatchFrames);
+                session.PendingBatch.Return();
                 session.PendingBatch = null;
             }
         }
@@ -309,7 +335,7 @@ public sealed partial class RelayHub
 
     public int BootstrapCount => _bootstraps.Count;
 
-    private static ulong Hash64(byte[] body) => XxHash3.HashToUInt64(body);
+    private static ulong Hash64(ReadOnlySpan<byte> body) => XxHash3.HashToUInt64(body);
 
     public Task StartReaper(CancellationToken ct) => Task.Run(async () =>
     {
@@ -320,17 +346,45 @@ public sealed partial class RelayHub
             var now = DateTime.UtcNow;
             // REL-011: one broken session must never kill the idle reaper —
             // silent death here would pin every session slot forever.
+            // PERF-006: all deltas flush as a single SQLite statement.
+            List<(string KeyId, long Up, long Down)>? batch = _store == null ? null : [];
+            var unflushed = new List<(Session s, long up, long down)>();
             foreach (var s in _sessions.Values)
             {
                 try
                 {
                     if ((now - s.LastActivity).TotalSeconds > _opt.ReconnectGraceSeconds)
                         CloseSession(s, "idle");
-                    AggregateTraffic(s);
+                    if (batch != null)
+                    {
+                        var up = Interlocked.Exchange(ref s.UpBytesTotal, 0);
+                        var down = Interlocked.Exchange(ref s.DownBytesTotal, 0);
+                        if (up != 0 || down != 0)
+                        {
+                            batch.Add((s.KeyId, up, down));
+                            unflushed.Add((s, up, down));
+                        }
+                    }
                 }
                 catch (Exception e)
                 {
                     _log.LogError("event=reaper_session_failed err={Error}", e.Message);
+                }
+            }
+            if (batch is { Count: > 0 })
+            {
+                try
+                {
+                    _store!.AggregateTrafficBatch(batch);
+                }
+                catch (Exception e)
+                {
+                    foreach (var (s, up, down) in unflushed)
+                    {
+                        Interlocked.Add(ref s.UpBytesTotal, up); // not lost: retry next tick
+                        Interlocked.Add(ref s.DownBytesTotal, down);
+                    }
+                    _log.LogWarning("event=traffic_aggregate_failed err={Error}", e.Message);
                 }
             }
             foreach (var kv in _bootstraps)
@@ -348,7 +402,7 @@ public sealed partial class RelayHub
         var down = Interlocked.Exchange(ref s.DownBytesTotal, 0);
         if (up != 0 || down != 0)
         {
-            try { _store.AggregateTraffic(s.KeyId, up, down); }
+            try { _store.AggregateTrafficBatch([(s.KeyId, up, down)]); }
             catch (Exception e)
             {
                 Interlocked.Add(ref s.UpBytesTotal, up); // not lost: retry next tick
@@ -381,7 +435,7 @@ public sealed partial class RelayHub
 
     // ---- uplink -------------------------------------------------------------
 
-    public async Task<UpResult> ApplyUp(Session session, int seq, byte[] body)
+    public async Task<UpResult> ApplyUp(Session session, int seq, ReadOnlyMemory<byte> body)
     {
         if (session.Dead)
             return new UpResult(UpOutcome.Fatal, session.LastSeq, "session closed");
@@ -395,7 +449,7 @@ public sealed partial class RelayHub
             {
                 if (seq == session.LastSeq)
                 {
-                    if (session.LastBodyHashSet && session.LastBodyHash == Hash64(body))
+                    if (session.LastBodyHashSet && session.LastBodyHash == Hash64(body.Span))
                         return new UpResult(UpOutcome.DuplicateAcked, seq);
                     return new UpResult(UpOutcome.Fatal, seq, "duplicate seq with different body");
                 }
@@ -423,7 +477,7 @@ public sealed partial class RelayHub
             lock (session.Sync)
             {
                 session.LastSeq = seq;
-                session.LastBodyHash = Hash64(body);
+                session.LastBodyHash = Hash64(body.Span);
                 session.LastBodyHashSet = true;
             }
             FlushWindowGrants(session);
@@ -559,8 +613,10 @@ public sealed partial class RelayHub
             }
             Interlocked.Add(ref st.RecvAvail, payload.Length);
             // Credit back is coalesced per stream and flushed at batch boundaries,
-            // instead of one tiny WINDOW frame per DATA frame.
+            // instead of one tiny WINDOW frame per DATA frame (PERF-005).
             Interlocked.Add(ref st.GrantPending, payload.Length);
+            if (st.MarkGrantQueued())
+                session.GrantQueue.Enqueue(id);
         }
         finally
         {
@@ -629,20 +685,30 @@ public sealed partial class RelayHub
                 Counters.DialInFlightSet(_dialsInFlight);
             }
 
-            var buf = new byte[FrameCodec.DataChunk];
-            while (!st.Closed && !session.Cts.IsCancellationRequested)
+            // PERF-004: the pump's read buffer comes from the ArrayPool and is
+            // returned when the stream dies, instead of a fresh 64 KiB
+            // allocation per stream.
+            var buf = ArrayPool<byte>.Shared.Rent(FrameCodec.DataChunk);
+            try
             {
-                if (Volatile.Read(ref st.SendAvail) <= 0)
+                while (!st.Closed && !session.Cts.IsCancellationRequested)
                 {
-                    await st.WindowSignal.WaitAsync(session.Cts.Token);
-                    continue;
+                    if (Volatile.Read(ref st.SendAvail) <= 0)
+                    {
+                        await st.WindowSignal.WaitAsync(session.Cts.Token);
+                        continue;
+                    }
+                    var want = (int)Math.Min(buf.Length, Volatile.Read(ref st.SendAvail));
+                    var n = await st.Net.ReadAsync(buf.AsMemory(0, want), session.Cts.Token);
+                    if (n == 0)
+                        break; // backend EOF
+                    Interlocked.Add(ref st.SendAvail, -n);
+                    await EnqueueDownAsync(session, FrameBuf.RentData(st.Id, buf.AsSpan(0, n)));
                 }
-                var want = (int)Math.Min(buf.Length, Volatile.Read(ref st.SendAvail));
-                var n = await st.Net.ReadAsync(buf.AsMemory(0, want), session.Cts.Token);
-                if (n == 0)
-                    break; // backend EOF
-                Interlocked.Add(ref st.SendAvail, -n);
-                await EnqueueDownAsync(session, FrameBuf.RentData(st.Id, buf.AsSpan(0, n)));
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buf);
             }
         }
         catch (Exception e) when (e is OperationCanceledException or SocketException or ObjectDisposedException or ChannelClosedException)
@@ -795,17 +861,27 @@ public sealed partial class RelayHub
         Counters.PendingItems(-items);
     }
 
-    /// <summary>Flush coalesced WINDOW credits into the down queue.</summary>
+    /// <summary>
+    /// Flush coalesced WINDOW credits into the down queue (PERF-005: the
+    /// pending-credit queue replaces an O(streams) scan on every batch).
+    /// </summary>
     private void FlushWindowGrants(Session session)
     {
         if (session.Dead)
             return;
-        foreach (var st in session.Streams.Values)
+        while (session.GrantQueue.TryDequeue(out var id))
         {
-            var granted = Interlocked.Exchange(ref st.GrantPending, 0);
-            if (granted <= 0 || st.Closed)
+            if (!session.Streams.TryGetValue(id, out var st))
                 continue;
-            _ = EnqueueDownAsync(session, FrameBuf.Buy(FrameCodec.EncodeWindow(st.Id, (uint)granted)));
+            var granted = Interlocked.Exchange(ref st.GrantPending, 0);
+            st.ClearGrantQueued();
+            if (granted > 0 && !st.Closed)
+                _ = EnqueueDownAsync(session, FrameBuf.Buy(FrameCodec.EncodeWindow(id, (uint)granted)));
+            // A credit added between the exchange and the flag clear missed
+            // the queue: re-arm (idempotent, TryDequeue dedupes nothing but
+            // the flag keeps the queue bounded to one entry per stream).
+            if (Volatile.Read(ref st.GrantPending) > 0 && st.MarkGrantQueued())
+                session.GrantQueue.Enqueue(id);
         }
     }
 
@@ -815,7 +891,7 @@ public sealed partial class RelayHub
             return new DownResult(null, cursor, false, true);
 
         // Replay the unacknowledged batch byte-for-byte.
-        byte[]? replay;
+        PooledBatch? replay;
         lock (session.Sync)
         {
             if (cursor != session.AckedCursor && cursor != session.PendingCursor)
@@ -833,6 +909,7 @@ public sealed partial class RelayHub
                     // until this cursor acknowledges them (PROTOCOL.md).
                     session.AckedCursor = cursor;
                     ReleaseCharge(session, session.PendingBatch.Length, session.PendingBatchFrames);
+                    session.PendingBatch.Return();
                     session.PendingBatch = null;
                 }
             }
@@ -905,11 +982,11 @@ public sealed partial class RelayHub
             }
 
             var frameCount = frames.Count;
-            var body = new byte[bytes];
+            var batch = PooledBatch.Rent(bytes);
             var off = 0;
             foreach (var f in frames)
             {
-                f.Span.CopyTo(body.AsSpan(off));
+                f.Span.CopyTo(batch.Buffer.AsSpan(off));
                 off += f.Length;
             }
             ReturnFrames(frames);
@@ -921,18 +998,19 @@ public sealed partial class RelayHub
                     // Raced CloseSession after our TryReads: never install a
                     // batch on a dead session — with no acker left its charge
                     // would leak into the global gauges (REL-001).
-                    ReleaseCharge(session, body.Length, frameCount);
-                    Counters.DownBatch(body.Length);
+                    ReleaseCharge(session, batch.Length, frameCount);
+                    batch.Return();
+                    Counters.DownBatch(batch.Length);
                     return DownResult.Empty(cursor);
                 }
                 session.PendingCursor = session.AckedCursor + 1;
-                session.PendingBatch = body;
+                session.PendingBatch = batch;
                 session.PendingBatchFrames = frameCount;
                 newCursor = session.PendingCursor;
             }
-            Counters.DownBatch(body.Length);
-            Interlocked.Add(ref session.DownBytesTotal, body.Length);
-            return DownResult.Batch(body, newCursor);
+            Counters.DownBatch(batch.Length);
+            Interlocked.Add(ref session.DownBytesTotal, batch.Length);
+            return DownResult.Batch(batch, newCursor);
         }
         catch (OperationCanceledException)
         {
@@ -985,32 +1063,42 @@ public sealed partial class RelayHub
                     continue;
                 }
                 var frameCount = frames.Count;
-                var body = new byte[bytes];
+                var batch = PooledBatch.Rent(bytes);
                 var off = 0;
                 foreach (var f in frames)
                 {
-                    f.Span.CopyTo(body.AsSpan(off));
+                    f.Span.CopyTo(batch.Buffer.AsSpan(off));
                     off += f.Length;
                 }
                 ReturnFrames(frames);
                 // WS drain releases the charge immediately: no cursor replay
                 // exists on this carrier, so delivery == acknowledgement.
-                ReleaseCharge(session, body.Length, frameCount);
-                _log.LogDebug("event=ws_send bytes={Bytes} frames={Frames}", body.Length, frameCount);
-                Counters.DownBatch(body.Length);
-                Interlocked.Add(ref session.DownBytesTotal, body.Length);
-                await ws.SendAsync(body, WebSocketMessageType.Binary, true, ct);
+                ReleaseCharge(session, batch.Length, frameCount);
+                _log.LogDebug("event=ws_send bytes={Bytes} frames={Frames}", batch.Length, frameCount);
+                Counters.DownBatch(batch.Length);
+                Interlocked.Add(ref session.DownBytesTotal, batch.Length);
+                try
+                {
+                    await ws.SendAsync(batch.Payload, WebSocketMessageType.Binary, true, ct);
+                }
+                finally
+                {
+                    batch.Return();
+                }
                 session.Touch(); // ws carrier: activity keeps the idle reaper away
-                _log.LogDebug("event=ws_sent bytes={Bytes}", body.Length);
+                _log.LogDebug("event=ws_sent bytes={Bytes}", batch.Length);
             }
         }, ct);
 
         var buf = new byte[64 * 1024];
+        // PERF-010: one receive buffer per socket, reset per message — instead
+        // of a fresh MemoryStream for every websocket message.
+        var recv = new MemoryStream(64 * 1024);
         try
         {
             while (!ct.IsCancellationRequested && ws.State == WebSocketState.Open)
             {
-                using var ms = new System.IO.MemoryStream();
+                recv.SetLength(0);
                 WebSocketReceiveResult result;
                 do
                 {
@@ -1019,17 +1107,17 @@ public sealed partial class RelayHub
                         goto done;
                     if (result.MessageType == WebSocketMessageType.Text)
                         goto done; // text messages are rejected
-                    ms.Write(buf, 0, result.Count);
-                    if (ms.Length > _opt.DownBatchTargetBytes)
+                    recv.Write(buf, 0, result.Count);
+                    if (recv.Length > _opt.DownBatchTargetBytes)
                         goto done; // oversized message
                 }
                 while (!result.EndOfMessage);
 
-                var frames = FrameCodec.ParseAll(ms.GetBuffer().AsMemory(0, (int)ms.Length), _opt.MaxFramePayload);
+                var frames = FrameCodec.ParseAll(recv.GetBuffer().AsMemory(0, (int)recv.Length), _opt.MaxFramePayload);
                 foreach (var f in frames)
                     if (!FrameCodec.IsValidClientFrame(f))
                         goto done;
-                _log.LogDebug("event=ws_recv bytes={Bytes} frames={Frames}", ms.Length, frames.Count);
+                _log.LogDebug("event=ws_recv bytes={Bytes} frames={Frames}", recv.Length, frames.Count);
                 Counters.FramesIn(frames.Count);
                 session.Touch(); // ws carrier: activity keeps the idle reaper away
                 try
@@ -1045,8 +1133,8 @@ public sealed partial class RelayHub
                     goto done;
                 }
                 FlushWindowGrants(session);
-                Counters.UpBatch((int)ms.Length);
-                Interlocked.Add(ref session.UpBytesTotal, ms.Length);
+                Counters.UpBatch((int)recv.Length);
+                Interlocked.Add(ref session.UpBytesTotal, recv.Length);
             }
         done:;
         }

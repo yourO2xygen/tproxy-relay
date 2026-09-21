@@ -197,13 +197,21 @@ public static class RelayApp
                 ctx.Response.Headers["X-Error"] = "body_too_large";
                 return;
             }
-            var body = await ReadBodyCapped(ctx, 64);
-            if (body == null)
+            // Small body (≤64 B): a plain exact-size read, no pooling needed.
+            var hello = new byte[64];
+            var helloLen = 0;
+            int n2;
+            while ((n2 = await ctx.Request.Body.ReadAsync(hello.AsMemory(helloLen), ctx.RequestAborted)) > 0)
             {
-                ctx.Response.StatusCode = 400; // oversized, chunked included
-                ctx.Response.Headers["X-Error"] = "body_too_large";
-                return;
+                helloLen += n2;
+                if (helloLen > 64)
+                {
+                    ctx.Response.StatusCode = 400; // oversized, chunked included
+                    ctx.Response.Headers["X-Error"] = "body_too_large";
+                    return;
+                }
             }
+            var body = hello[..helloLen];
             if (!FrameCodec.IsValidHello(body))
             {
                 app.Logger.LogWarning("event=session_400 reason=invalid_hello len={Len}", body.Length);
@@ -261,8 +269,8 @@ public static class RelayApp
                 ctx.Response.Headers["X-Error"] = "body_too_large";
                 return;
             }
-            var body = await ReadBodyCapped(ctx, 2 * 1024 * 1024);
-            if (body == null)
+            var batch = await ReadBodyCapped(ctx, 2 * 1024 * 1024);
+            if (batch == null)
             {
                 // API-009/SEC-005: chunked oversize fails fast instead of
                 // buffering megabytes before the refusal.
@@ -270,49 +278,56 @@ public static class RelayApp
                 ctx.Response.Headers["X-Error"] = "body_too_large";
                 return;
             }
-            var laneId = ParseLaneId(ctx, session.LanesMode);
-            if (laneId < 0)
+            try
             {
-                ctx.Response.StatusCode = 400; // lanes mode requires a valid X-Lane-ID
-                ctx.Response.Headers["X-Error"] = "bad_lane_header";
-                return;
-            }
-            if (session.LanesMode)
-            {
-                var laneResult = await hub.ApplyUpLane(session, (uint)laneId, seq, body);
-                switch (laneResult.Outcome)
+                var laneId = ParseLaneId(ctx, session.LanesMode);
+                if (laneId < 0)
                 {
-                    case LaneOutcome.Ok or LaneOutcome.LaneClosed:
+                    ctx.Response.StatusCode = 400; // lanes mode requires a valid X-Lane-ID
+                    ctx.Response.Headers["X-Error"] = "bad_lane_header";
+                    return;
+                }
+                if (session.LanesMode)
+                {
+                    var laneResult = await hub.ApplyUpLane(session, (uint)laneId, seq, batch.Payload);
+                    switch (laneResult.Outcome)
+                    {
+                        case LaneOutcome.Ok or LaneOutcome.LaneClosed:
+                            ctx.Response.StatusCode = 204;
+                            ctx.Response.Headers["X-Up-Ack"] = laneResult.AckSeq.ToString();
+                            return;
+                        case LaneOutcome.RetryLater:
+                            ctx.Response.StatusCode = 503;
+                            ctx.Response.Headers["Retry-After"] = "1";
+                            return;
+                        default:
+                            hub.CloseSession(session, $"uplink error: {laneResult.Error}");
+                            ctx.Response.StatusCode = 409;
+                            ctx.Response.Headers["X-Error"] = ErrorSlug("uplink", laneResult.Error);
+                            return;
+                    }
+                }
+                var result = await hub.ApplyUp(session, seq, batch.Payload);
+                switch (result.Outcome)
+                {
+                    case UpOutcome.Acked or UpOutcome.DuplicateAcked:
                         ctx.Response.StatusCode = 204;
-                        ctx.Response.Headers["X-Up-Ack"] = laneResult.AckSeq.ToString();
+                        ctx.Response.Headers["X-Up-Ack"] = result.AckSeq.ToString();
                         return;
-                    case LaneOutcome.RetryLater:
+                    case UpOutcome.RetryLater:
                         ctx.Response.StatusCode = 503;
                         ctx.Response.Headers["Retry-After"] = "1";
                         return;
                     default:
-                        hub.CloseSession(session, $"uplink error: {laneResult.Error}");
+                        hub.CloseSession(session, $"uplink error: {result.Error}");
                         ctx.Response.StatusCode = 409;
-                        ctx.Response.Headers["X-Error"] = ErrorSlug("uplink", laneResult.Error);
+                        ctx.Response.Headers["X-Error"] = ErrorSlug("uplink", result.Error);
                         return;
                 }
             }
-            var result = await hub.ApplyUp(session, seq, body);
-            switch (result.Outcome)
+            finally
             {
-                case UpOutcome.Acked or UpOutcome.DuplicateAcked:
-                    ctx.Response.StatusCode = 204;
-                    ctx.Response.Headers["X-Up-Ack"] = result.AckSeq.ToString();
-                    return;
-                case UpOutcome.RetryLater:
-                    ctx.Response.StatusCode = 503;
-                    ctx.Response.Headers["Retry-After"] = "1";
-                    return;
-                default:
-                    hub.CloseSession(session, $"uplink error: {result.Error}");
-                    ctx.Response.StatusCode = 409;
-                    ctx.Response.Headers["X-Error"] = ErrorSlug("uplink", result.Error);
-                    return;
+                batch.Return();
             }
         });
 
@@ -365,7 +380,7 @@ public static class RelayApp
             ctx.Response.Headers["X-Down-Cursor"] = result.Cursor.ToString();
             ctx.Response.Headers.CacheControl = "no-store";
             ctx.Response.ContentType = "application/octet-stream";
-            await ctx.Response.Body.WriteAsync(result.Body);
+            await ctx.Response.Body.WriteAsync(result.Body.Payload);
         });
 
         app.MapDelete(webRoot + "api/v1/session", async (HttpContext ctx) =>
@@ -496,22 +511,51 @@ public static class RelayApp
     }
 
     /// <summary>
-    /// SEC-005: stream-read a request body with a hard cap; chunked oversize
-    /// fails as soon as the cap is crossed instead of buffering fully first.
-    /// Returns null when the body exceeds the cap.
+    /// SEC-005/PERF-003: stream-read a request body with a hard cap into a
+    /// pooled buffer that grows by re-renting (never a MemoryStream plus a
+    /// full copy); chunked oversize fails as soon as the cap is crossed.
+    /// Returns null when the body exceeds the cap. The caller owns and must
+    /// Return() the batch.
     /// </summary>
-    private static async Task<byte[]?> ReadBodyCapped(HttpContext ctx, int cap)
+    private static async Task<PooledBatch?> ReadBodyCapped(HttpContext ctx, int cap)
     {
         var buf = new byte[8192];
-        using var ms = new MemoryStream(Math.Min(cap, 8192));
-        int n;
-        while ((n = await ctx.Request.Body.ReadAsync(buf.AsMemory(0, buf.Length), ctx.RequestAborted)) > 0)
+        var acc = PooledBatch.Rent(Math.Min(cap, 64 * 1024));
+        acc.Length = 0; // Rent() pre-sets Length to the rented size; we count bytes ourselves
+        try
         {
-            if (ms.Length + n > cap)
-                return null;
-            await ms.WriteAsync(buf.AsMemory(0, n), ctx.RequestAborted);
+            int n;
+            while ((n = await ctx.Request.Body.ReadAsync(buf, ctx.RequestAborted)) > 0)
+            {
+                if (acc.Length + n > cap)
+                {
+                    acc.Return();
+                    return null;
+                }
+                if (acc.Length + n > acc.Buffer.Length)
+                {
+                    // Grow: rent bigger, copy, return the old buffer.
+                    var grown = 0;
+                    while (grown < acc.Length + n)
+                        grown = checked(grown * 2 + 64 * 1024);
+                    var bigger = PooledBatch.Rent(Math.Min(grown, cap));
+                    acc.Buffer.AsSpan(0, acc.Length).CopyTo(bigger.Buffer);
+                    // Rent() pre-sets Length to the requested capacity; the
+                    // new batch must carry the OLD byte count.
+                    bigger.Length = acc.Length;
+                    acc.Return();
+                    acc = bigger;
+                }
+                buf.AsSpan(0, n).CopyTo(acc.Buffer.AsSpan(acc.Length, n));
+                acc.Length += n;
+            }
+            return acc;
         }
-        return ms.ToArray();
+        catch
+        {
+            acc.Return();
+            throw;
+        }
     }
 
     /// <summary>API-008: short machine-readable reason for X-Error headers.</summary>

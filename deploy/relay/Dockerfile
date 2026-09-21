@@ -1,7 +1,9 @@
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
 COPY src/TproxyRelay/TproxyRelay.csproj ./TproxyRelay/
-RUN dotnet restore TproxyRelay/TproxyRelay.csproj
+# DEP-004: restore against the committed lock file — no transitive drift.
+COPY src/TproxyRelay/packages.lock.json ./TproxyRelay/
+RUN dotnet restore TproxyRelay/TproxyRelay.csproj --locked-mode
 COPY src/TproxyRelay/ ./TproxyRelay/
 RUN dotnet publish TproxyRelay/TproxyRelay.csproj -c Release -o /app --no-restore
 

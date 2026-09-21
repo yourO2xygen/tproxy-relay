@@ -21,12 +21,36 @@ jobs:
         with:
           dotnet-version: 10.0.x
 
+      - name: Cache NuGet packages
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ hashFiles('**/packages.lock.json') }}
+          restore-keys: nuget-
+
+      - name: Restore (locked)
+        run: dotnet restore --locked-mode
+
       - name: Build
-        run: dotnet build src/TproxyRelay -c Release
+        run: dotnet build src/TproxyRelay -c Release --no-restore
 
-      - name: Unit tests
-        run: dotnet test tests/TproxyRelay.Tests -c Release
+      - name: Unit + integration tests
+        run: >
+          dotnet test tests/TproxyRelay.Tests -c Release --no-restore
+          --blame-hang-timeout 10m
+          --collect:"XPlat Code Coverage"
+          --results-directory ./coverage
 
-      - name: Docker image builds
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage
+          path: coverage
+          retention-days: 7
+
+      - name: Docker image builds (all)
         run: |
           docker build -t tproxy-relay:ci -f deploy/relay/Dockerfile .
+          docker build -t tproxy-nginx:ci -f deploy/nginx/Dockerfile .
+          docker build -t tproxy-mtproxy:ci -f deploy/mtproxy/Dockerfile deploy/mtproxy

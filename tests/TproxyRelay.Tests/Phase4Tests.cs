@@ -160,7 +160,7 @@ public class Phase4HubTests : IAsyncLifetime
         {
             var down = await hub.GetDown(session, 0, cts.Token);
             if (!down.HasBatch) continue;
-            foreach (var f in FrameCodec.ParseAll(down.Body!))
+            foreach (var f in FrameCodec.ParseAll(down.Body!.Payload))
                 if (f.Type == FrameType.Close && f.StreamId == 6)
                     sawClose6 = true;
         }
@@ -240,7 +240,7 @@ public class Phase4HubTests : IAsyncLifetime
         for (var i = 0; i < 20; i++)
         {
             down = await _hub.GetDown(session, 0, cts.Token);
-            if (down.HasBatch && FrameCodec.ParseAll(down.Body!).Any(f => f.Type == FrameType.Data))
+            if (down.HasBatch && FrameCodec.ParseAll(down.Body!.Payload).Any(f => f.Type == FrameType.Data))
                 break;
         }
         Assert.True(down.HasBatch);

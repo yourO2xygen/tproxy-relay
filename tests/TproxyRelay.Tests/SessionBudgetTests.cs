@@ -33,7 +33,7 @@ public class SessionBudgetTests
         lock (s.Sync)
         {
             // Simulate a GetDown batch handed to the client but never acked.
-            s.PendingBatch = new byte[128];
+            s.PendingBatch = PooledBatch.Rent(128);
             s.PendingBatchFrames = 2;
             var charge = 128 + 2 * RelayHub.ItemOverhead;
             Interlocked.Add(ref s.PendingBytes, charge);
@@ -65,7 +65,7 @@ public class SessionBudgetTests
         await hub.EnqueueDownLaneAsync(s, FrameBuf.Buy(FrameCodec.EncodeWindow(7, 64)));
         lock (lane.Sync)
         {
-            lane.PendingBatch = new byte[32];
+            lane.PendingBatch = PooledBatch.Rent(32);
             lane.PendingBatchFrames = 1;
             var charge = 32 + RelayHub.ItemOverhead;
             Interlocked.Add(ref lane.QueuedCharge, charge);

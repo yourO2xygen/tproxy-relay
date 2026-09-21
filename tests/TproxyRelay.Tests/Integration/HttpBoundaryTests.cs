@@ -85,6 +85,21 @@ public sealed class HttpBoundaryTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Uplink_Small_Body_Is_Acked()
+    {
+        // The happy path through the pooled body reader (regression: the
+        // rented buffer's Length once started at capacity, not 0).
+        var (session, _) = await CreateSessionAsync();
+        using var req = new HttpRequestMessage(HttpMethod.Post, "/api/v1/up");
+        req.Headers.TryAddWithoutValidation("Authorization", "Bearer " + session);
+        req.Headers.TryAddWithoutValidation("X-Up-Seq", "1");
+        req.Content = new ByteArrayContent(FrameCodec.Encode(FrameType.Open, 1));
+        var resp = await _host.Public.SendAsync(req);
+        Assert.Equal(HttpStatusCode.NoContent, resp.StatusCode);
+        Assert.Equal("1", resp.Headers.GetValues("X-Up-Ack").Single());
+    }
+
+    [Fact]
     public async Task Uplink_Requires_A_Valid_Seq_Header()
     {
         var (session, _) = await CreateSessionAsync();

@@ -35,6 +35,12 @@ stop_one() { # port
     fi
 }
 
+# REL-002: a pid file alone proves nothing — verify the child is alive.
+alive_one() { # port -> 0 when a live process holds the pid file
+    [ -f "$RUN/port-$1.pid" ] || return 1
+    kill -0 "$(cat "$RUN/port-$1.pid")" 2>/dev/null
+}
+
 # Built-in profile from the environment: the default client listener.
 start_one 2398 "$MTPROXY_SECRET"
 
@@ -52,10 +58,15 @@ start_one 2398 "$MTPROXY_SECRET"
                 [ "$port" = 2398 ] && continue
                 echo "$wanted" | grep -q "^$port " || stop_one "$port"
             done
-            # start processes for new keys
+            # start processes for new keys, and respawn any child that died
+            # (a stale pid file is not "alive": verify, clean, restart)
             echo "$wanted" | while IFS=' ' read -r port secret; do
                 [ -n "$port" ] || continue
-                [ -e "$RUN/port-$port.pid" ] && continue
+                if alive_one "$port"; then
+                    continue
+                fi
+                rm -f "$RUN/port-$port.pid"
+                echo "event=child_respawn port=$port" >>"$RUN/log-$port" 2>/dev/null || true
                 start_one "$port" "$secret"
             done
         fi
