@@ -23,6 +23,10 @@ services:
       # Пусто = прокси в корне хоста; со слагом все пути переезжают под /<base>/,
       # а capability выводится из host+path (ссылка использует маркированный секрет).
       TPROXY_BASE_PATH: ${TPROXY_BASE_PATH:-}
+      # Сайт-прикрытие (взаимоисключающие; см. docs/PUBLIC_SITE.md и README).
+      TPROXY_PUBLIC_DIR: ${TPROXY_PUBLIC_DIR:-}
+      TPROXY_PUBLIC_UPSTREAM: ${TPROXY_PUBLIC_UPSTREAM:-}
+      TPROXY_STATIC_ROUTES: ${TPROXY_STATIC_ROUTES:-}
       TPROXY_TOKEN_KEY_PATH: /data/token.key
       TPROXY_KEYS_DB: /data/keys.db
       # SEC-001: дефолт админ-листенера теперь 127.0.0.1; для port-mapping

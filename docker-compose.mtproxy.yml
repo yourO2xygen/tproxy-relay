@@ -1,6 +1,0 @@
-# Point the relay at the real official MTProxy container (profile "mtproxy").
-# Usage: docker compose -f docker-compose.yml -f docker-compose.mtproxy.yml --profile mtproxy up -d
-services:
-  relay:
-    environment:
-      TPROXY_BACKEND_HOST: mtproxy:2398

@@ -31,12 +31,16 @@ jobs:
       - name: Restore (locked)
         run: |
           dotnet restore --locked-mode src/TproxyRelay
-          dotnet restore --locked-mode tests/TproxyRelay.Tests
+          if [ -d tests/TproxyRelay.Tests ]; then
+            dotnet restore --locked-mode tests/TproxyRelay.Tests
+          fi
 
       - name: Build
         run: dotnet build src/TproxyRelay -c Release --no-restore
 
+      # Тесты существуют только на dev (main — прод-файлы); шаг сам пропускается.
       - name: Unit + integration tests
+        if: ${{ hashFiles('tests/TproxyRelay.Tests/*.csproj') != '' }}
         run: >
           dotnet test tests/TproxyRelay.Tests -c Release --no-restore
           --blame-hang-timeout 10m
@@ -44,15 +48,18 @@ jobs:
           --results-directory ./coverage
 
       - name: Upload coverage
-        if: always()
+        if: ${{ always() && hashFiles('tests/TproxyRelay.Tests/*.csproj') != '' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: coverage
           path: coverage
           retention-days: 7
 
-      - name: Docker image builds (all)
+      - name: Docker image builds (prod)
         run: |
           docker build -t tproxy-relay:ci -f deploy/relay/Dockerfile .
-          docker build -t tproxy-nginx:ci deploy/nginx
           docker build -t tproxy-mtproxy:ci deploy/mtproxy
+
+      - name: Docker image builds (dev nginx)
+        if: ${{ hashFiles('deploy/nginx/Dockerfile') != '' }}
+        run: docker build -t tproxy-nginx:ci deploy/nginx

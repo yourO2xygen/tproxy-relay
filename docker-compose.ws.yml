@@ -1,6 +1,0 @@
-# Carrier override: single multiplexed WebSocket instead of serialized HTTPS.
-# Usage: docker compose -f docker-compose.yml -f docker-compose.ws.yml up -d --build relay
-services:
-  relay:
-    environment:
-      TPROXY_CARRIER_MODE: websocket
