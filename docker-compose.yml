@@ -27,6 +27,9 @@ services:
       TPROXY_BACKEND_HOST: backend-stub:9000
       TPROXY_CARRIER_MODE: https
       TPROXY_BASE_PATH: ${TPROXY_BASE_PATH:-}
+      TPROXY_PUBLIC_DIR: ${TPROXY_PUBLIC_DIR:-}
+      TPROXY_PUBLIC_UPSTREAM: ${TPROXY_PUBLIC_UPSTREAM:-}
+      TPROXY_STATIC_ROUTES: ${TPROXY_STATIC_ROUTES:-}
       TPROXY_TOKEN_KEY_PATH: /data/token.key
       TPROXY_KEYS_DB: /data/keys.db
       # SEC-001: контейнер слушает admin на всех интерфейцах только потому,
