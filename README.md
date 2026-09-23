@@ -1,5 +1,7 @@
 # tproxy-relay — Telegram MTProto поверх обычного HTTPS
 
+[English](README_EN.md) | **Русский**
+
 [![ci](https://github.com/yourO2xygen/tproxy-relay/actions/workflows/ci.yml/badge.svg)](https://github.com/yourO2xygen/tproxy-relay/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/tag/yourO2xygen/tproxy-relay?sort=semver&label=release)](https://github.com/yourO2xygen/tproxy-relay/releases)
 [![license](https://img.shields.io/github/license/yourO2xygen/tproxy-relay)](LICENSE)
